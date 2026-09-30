@@ -1,0 +1,275 @@
+# Adapted from the supplied ODR-DabMux production INFO configuration.
+# Automatic local offset uses the host timezone; bulletin URLs require HTTPS access.
+ensemble:
+  id: 1
+  ecc: 225
+  label: RND D00 - XX
+  short_label: RND D00
+  mode: 1
+  tist: true
+  tist_offset_ms: 2000
+  tai_clock_bulletins: https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list|https://raw.githubusercontent.com/eggert/tz/master/leap-seconds.list
+  local_time_offset_auto: true
+  international_table: 1
+services:
+- uid: srv-rnd001
+  id: 16385
+  label: 105 DJ HRND-001
+  short_label: HRND-001
+  pty: 15
+  language: 8
+- uid: srv-rnd002
+  id: 16386
+  label: TOP CC HRND-002
+  short_label: HRND-002
+  pty: 15
+  language: 8
+- uid: srv-rnd003
+  id: 16387
+  label: MAXXIMA HRND-003
+  short_label: HRND-003
+  pty: 15
+  language: 8
+- uid: srv-rnd004
+  id: 16388
+  label: HELIUM RND-004
+  short_label: HRND-004
+  pty: 15
+  language: 8
+- uid: srv-rnd005
+  id: 16389
+  label: HELIUM RND-005
+  short_label: HRND-005
+  pty: 15
+  language: 8
+- uid: srv-rnd006
+  id: 16390
+  label: HELIUM RND-006
+  short_label: HRND-006
+  pty: 15
+  language: 8
+- uid: srv-rnd007
+  id: 16391
+  label: HELIUM RND-007
+  short_label: HRND-007
+  pty: 15
+  language: 8
+- uid: srv-rnd008
+  id: 16392
+  label: HELIUM RND-008
+  short_label: HRND-008
+  pty: 15
+  language: 8
+- uid: srv-rnd009
+  id: 16393
+  label: HELIUM RND-009
+  short_label: HRND-009
+  pty: 15
+  language: 8
+- uid: srv-rnd010
+  id: 16400
+  label: HELIUM RND-010
+  short_label: HRND-010
+  pty: 15
+  language: 8
+- uid: srv-rnd011
+  id: 16401
+  label: HELIUM RND-011
+  short_label: HRND-011
+  pty: 15
+  language: 8
+- uid: srv-rnd012
+  id: 16402
+  label: HELIUM RND-012
+  short_label: HRND-012
+  pty: 15
+  language: 8
+subchannels:
+- uid: sub-rnd001
+  id: 1
+  bitrate: 72
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9001
+- uid: sub-rnd002
+  id: 2
+  bitrate: 72
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9002
+- uid: sub-rnd003
+  id: 3
+  bitrate: 72
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9003
+- uid: sub-rnd004
+  id: 4
+  bitrate: 72
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9004
+- uid: sub-rnd005
+  id: 5
+  bitrate: 64
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9005
+- uid: sub-rnd006
+  id: 6
+  bitrate: 64
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9006
+- uid: sub-rnd007
+  id: 7
+  bitrate: 64
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9007
+- uid: sub-rnd008
+  id: 8
+  bitrate: 64
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9008
+- uid: sub-rnd009
+  id: 9
+  bitrate: 48
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9009
+- uid: sub-rnd010
+  id: 10
+  bitrate: 48
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9010
+- uid: sub-rnd011
+  id: 11
+  bitrate: 48
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9011
+- uid: sub-rnd012
+  id: 12
+  bitrate: 48
+  kind: dab_plus
+  protection:
+    profile: eep_a
+    level: 3
+  input:
+    protocol: edi
+    uri: tcp://0.0.0.0:9012
+components:
+- uid: comp-rnd001
+  service: srv-rnd001
+  subchannel: sub-rnd001
+  user_applications:
+  - slideshow
+- uid: comp-rnd002
+  service: srv-rnd002
+  subchannel: sub-rnd002
+  user_applications:
+  - slideshow
+- uid: comp-rnd003
+  service: srv-rnd003
+  subchannel: sub-rnd003
+  user_applications:
+  - slideshow
+- uid: comp-rnd004
+  service: srv-rnd004
+  subchannel: sub-rnd004
+  user_applications:
+  - slideshow
+- uid: comp-rnd005
+  service: srv-rnd005
+  subchannel: sub-rnd005
+  user_applications:
+  - slideshow
+- uid: comp-rnd006
+  service: srv-rnd006
+  subchannel: sub-rnd006
+  user_applications:
+  - slideshow
+- uid: comp-rnd007
+  service: srv-rnd007
+  subchannel: sub-rnd007
+  user_applications:
+  - slideshow
+- uid: comp-rnd008
+  service: srv-rnd008
+  subchannel: sub-rnd008
+  user_applications:
+  - slideshow
+- uid: comp-rnd009
+  service: srv-rnd009
+  subchannel: sub-rnd009
+  user_applications:
+  - slideshow
+- uid: comp-rnd010
+  service: srv-rnd010
+  subchannel: sub-rnd010
+  user_applications:
+  - slideshow
+- uid: comp-rnd011
+  service: srv-rnd011
+  subchannel: sub-rnd011
+  user_applications:
+  - slideshow
+- uid: comp-rnd012
+  service: srv-rnd012
+  subchannel: sub-rnd012
+  user_applications:
+  - slideshow
+output:
+  tagpacket_alignment: 16
+  destinations:
+  - protocol: tcp
+    listen_port: 8850
+    max_frames_queued: 500
+    preroll_ms: 3500

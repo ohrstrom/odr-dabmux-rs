@@ -9,6 +9,10 @@ pub struct FicCarousel {
     subchannel_cursor: usize,
     service_cursor: usize,
     label_cursor: usize,
+    metadata_stage: u8,
+    language_cursor: usize,
+    pty_cursor: usize,
+    application_cursor: usize,
 }
 
 impl FicCarousel {
@@ -17,6 +21,10 @@ impl FicCarousel {
             subchannel_cursor: 0,
             service_cursor: 0,
             label_cursor: 0,
+            metadata_stage: 0,
+            language_cursor: 0,
+            pty_cursor: 0,
+            application_cursor: 0,
         }
     }
 
@@ -115,6 +123,10 @@ impl FicCarousel {
         // Rotate labels while reserving a periodic slot for UTC time/date.
         if clock.count.is_multiple_of(4) {
             push(&mut fibs[2], &mut lengths[2], &fig0_10(clock))?;
+            push(&mut fibs[2], &mut lengths[2], &fig0_9(config, clock)?)?;
+            if let Some(fig) = self.next_metadata(config) {
+                push(&mut fibs[2], &mut lengths[2], &fig)?;
+            }
         } else {
             let label_fig = if self.label_cursor == 0 {
                 fig1_label(
@@ -134,8 +146,8 @@ impl FicCarousel {
             };
             push(&mut fibs[2], &mut lengths[2], &label_fig)?;
             self.label_cursor = (self.label_cursor + 1) % (config.source.services.len() + 1);
+            push(&mut fibs[2], &mut lengths[2], &fig0_9(config, clock)?)?;
         }
-        push(&mut fibs[2], &mut lengths[2], &fig0_9(config))?;
 
         let mut output = Vec::with_capacity(fib_count * 32);
         for (mut fib, used) in fibs.into_iter().zip(lengths) {
@@ -148,6 +160,92 @@ impl FicCarousel {
         }
         Ok(output)
     }
+
+    fn next_metadata(&mut self, config: &ValidatedConfig) -> Option<Vec<u8>> {
+        for _ in 0..3 {
+            let stage = self.metadata_stage;
+            let (entries, cursor, limit, extension): (Vec<Vec<u8>>, &mut usize, usize, u8) =
+                match stage {
+                    0 => {
+                        let entries = config
+                            .source
+                            .components
+                            .iter()
+                            .filter_map(|component| {
+                                let service = config
+                                    .source
+                                    .services
+                                    .iter()
+                                    .find(|service| service.uid == component.service)?;
+                                let sub = config
+                                    .source
+                                    .subchannels
+                                    .iter()
+                                    .find(|sub| sub.uid == component.subchannel)?;
+                                (service.language != 0).then_some(vec![sub.id, service.language])
+                            })
+                            .collect();
+                        (entries, &mut self.language_cursor, 7, 5)
+                    }
+                    1 => {
+                        let entries = config
+                            .source
+                            .services
+                            .iter()
+                            .filter(|service| service.pty != 0)
+                            .map(|service| {
+                                let [high, low] = (service.id as u16).to_be_bytes();
+                                vec![high, low, 0, service.pty]
+                            })
+                            .collect();
+                        (entries, &mut self.pty_cursor, 3, 17)
+                    }
+                    _ => {
+                        let entries = config
+                            .source
+                            .components
+                            .iter()
+                            .filter(|component| !component.user_applications.is_empty())
+                            .map(|component| {
+                                let service = config
+                                    .source
+                                    .services
+                                    .iter()
+                                    .find(|service| service.uid == component.service)
+                                    .expect("validated service");
+                                let scids = config
+                                    .source
+                                    .components
+                                    .iter()
+                                    .filter(|other| other.service == component.service)
+                                    .position(|other| other.uid == component.uid)
+                                    .expect("validated component");
+                                let [high, low] = (service.id as u16).to_be_bytes();
+                                vec![high, low, (scids as u8) << 4 | 1, 0, 0x42, 12, 60]
+                            })
+                            .collect();
+                        (entries, &mut self.application_cursor, 2, 13)
+                    }
+                };
+            if entries.is_empty() {
+                self.metadata_stage = (stage + 1) % 3;
+                continue;
+            }
+            let mut fig = vec![0, extension];
+            let end = (*cursor + limit).min(entries.len());
+            for entry in &entries[*cursor..end] {
+                fig.extend_from_slice(entry);
+            }
+            *cursor = end;
+            if *cursor == entries.len() {
+                *cursor = 0;
+                self.metadata_stage = (stage + 1) % 3;
+            }
+            fig[0] = (fig.len() - 1) as u8;
+            return Some(fig);
+        }
+        None
+    }
 }
 
 fn fig0_0(eid: u16, count: u64) -> [u8; 6] {
@@ -157,20 +255,24 @@ fn fig0_0(eid: u16, count: u64) -> [u8; 6] {
     [5, 0, e0, e1, high, low]
 }
 
-fn fig0_9(config: &ValidatedConfig) -> [u8; 5] {
-    let lto = config.source.ensemble.local_time_offset_half_hours;
+fn fig0_9(config: &ValidatedConfig, clock: FrameClock) -> Result<[u8; 5]> {
+    let lto = if config.source.ensemble.local_time_offset_auto {
+        crate::timing::local_offset_half_hours(clock.unix_seconds)?
+    } else {
+        config.source.ensemble.local_time_offset_half_hours
+    };
     let lto_field = if lto < 0 {
         ((-lto) as u8) | 0x20
     } else {
         lto as u8
     };
-    [
+    Ok([
         4,
         9,
         lto_field,
         config.source.ensemble.ecc,
         config.source.ensemble.international_table,
-    ]
+    ])
 }
 
 fn fig0_7(counter: u16, service_count: u8) -> [u8; 4] {
@@ -255,11 +357,14 @@ mod tests {
             id: 0x4da5,
             label: "Radio Two".into(),
             short_label: None,
+            pty: 0,
+            language: 0,
         });
         config.components.push(crate::config::ComponentConfig {
             uid: "component_two".into(),
             service: "radio_two".into(),
             subchannel: "audio_one".into(),
+            user_applications: Vec::new(),
         });
         let mut carousel = FicCarousel::new();
         let fibs = carousel
@@ -308,5 +413,107 @@ mod tests {
             .write(&valid, FrameClock::new(2, 0, 24).unwrap())
             .unwrap();
         assert_eq!(&second[64 + 20..64 + 22], &0x01feu16.to_be_bytes());
+    }
+
+    #[test]
+    fn production_programme_metadata_rotates_through_time_slots() {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        config.services[0].pty = 15;
+        config.services[0].language = 8;
+        config.components[0]
+            .user_applications
+            .push(crate::config::UserApplication::Slideshow);
+        let valid = config.validate().unwrap();
+        let mut carousel = FicCarousel::new();
+        let mut observed = Vec::new();
+        for count in 0..9 {
+            let fibs = carousel
+                .write(
+                    &valid,
+                    FrameClock::new(count, 0, count as u16 * 24).unwrap(),
+                )
+                .unwrap();
+            if count.is_multiple_of(4) {
+                observed.push(fibs[64 + 13..64 + 22].to_vec());
+            }
+        }
+        assert_eq!(&observed[0][..4], &[3, 5, 1, 8]);
+        assert_eq!(&observed[1][..6], &[5, 17, 0x4d, 0xa4, 0, 15]);
+        assert_eq!(&observed[2], &[8, 13, 0x4d, 0xa4, 1, 0, 0x42, 12, 60]);
+    }
+
+    #[test]
+    fn twelve_service_metadata_completes_within_one_carousel_cycle() {
+        use crate::config::{
+            ComponentConfig, InputConfig, ProtectionConfig, ServiceConfig, SubchannelConfig,
+            UserApplication,
+        };
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        config.services.clear();
+        config.subchannels.clear();
+        config.components.clear();
+        for index in 0..12 {
+            let uid = format!("service_{index}");
+            let sub_uid = format!("sub_{index}");
+            config.services.push(ServiceConfig {
+                uid: uid.clone(),
+                id: 0x4001 + index,
+                label: format!("Station {index}"),
+                short_label: None,
+                pty: 15,
+                language: 8,
+            });
+            config.subchannels.push(SubchannelConfig {
+                uid: sub_uid.clone(),
+                id: index as u8 + 1,
+                bitrate: if index < 4 {
+                    72
+                } else if index < 8 {
+                    64
+                } else {
+                    48
+                },
+                kind: SubchannelKind::DabPlus,
+                protection: ProtectionConfig::EepA { level: 3 },
+                input: InputConfig::Edi {
+                    uri: format!("tcp://127.0.0.1:{}", 9001 + index),
+                    stream_index: 1,
+                    buffer_frames: 40,
+                    prebuffer_frames: 4,
+                    timing: crate::config::InputTiming::Prebuffering,
+                },
+            });
+            config.components.push(ComponentConfig {
+                uid: format!("component_{index}"),
+                service: uid,
+                subchannel: sub_uid,
+                user_applications: vec![UserApplication::Slideshow],
+            });
+        }
+        let valid = config.validate().unwrap();
+        assert_eq!(
+            valid.subchannels.iter().map(|sub| sub.size_cu).sum::<u16>(),
+            552
+        );
+        let mut carousel = FicCarousel::new();
+        let mut totals = [0usize; 3];
+        for count in 0..48 {
+            let fibs = carousel
+                .write(&valid, FrameClock::new(count, 0, 0).unwrap())
+                .unwrap();
+            if !count.is_multiple_of(4) {
+                continue;
+            }
+            let fig = &fibs[64 + 13..];
+            match fig[1] {
+                5 => totals[0] += (usize::from(fig[0]) - 1) / 2,
+                17 => totals[1] += (usize::from(fig[0]) - 1) / 4,
+                13 => totals[2] += (usize::from(fig[0]) - 1) / 7,
+                _ => panic!("unexpected metadata extension"),
+            }
+        }
+        assert_eq!(totals, [12, 12, 12]);
     }
 }

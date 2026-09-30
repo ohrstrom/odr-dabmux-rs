@@ -91,13 +91,20 @@ pub struct EnsembleConfig {
     #[serde(default)]
     pub local_time_offset_half_hours: i8,
     #[serde(default)]
+    pub local_time_offset_auto: bool,
+    #[serde(default)]
     pub international_table: u8,
     pub reconfiguration_counter: Option<u16>,
     #[serde(default = "default_mode")]
     pub mode: u8,
     #[serde(default)]
     pub tist: bool,
+    #[serde(default)]
+    pub tist_offset_ms: i32,
+    #[serde(default)]
+    pub tist_at_fct0_ms: u16,
     pub tai_utc_offset: Option<u8>,
+    pub tai_clock_bulletins: Option<String>,
 }
 
 fn default_mode() -> u8 {
@@ -111,6 +118,10 @@ pub struct ServiceConfig {
     pub id: u32,
     pub label: String,
     pub short_label: Option<String>,
+    #[serde(default)]
+    pub pty: u8,
+    #[serde(default)]
+    pub language: u8,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -119,6 +130,14 @@ pub struct ComponentConfig {
     pub uid: String,
     pub service: String,
     pub subchannel: String,
+    #[serde(default)]
+    pub user_applications: Vec<UserApplication>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserApplication {
+    Slideshow,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -187,13 +206,32 @@ pub enum InputTiming {
 #[serde(deny_unknown_fields)]
 pub struct EdiOutputConfig {
     pub destinations: Vec<EdiDestination>,
+    #[serde(default = "default_tagpacket_alignment")]
+    pub tagpacket_alignment: u8,
+}
+
+fn default_tagpacket_alignment() -> u8 {
+    8
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "protocol", deny_unknown_fields)]
 pub enum EdiDestination {
-    Udp { address: String, port: u16 },
-    Tcp { listen_port: u16 },
+    Udp {
+        address: String,
+        port: u16,
+    },
+    Tcp {
+        listen_port: u16,
+        #[serde(default = "default_tcp_queue")]
+        max_frames_queued: usize,
+        #[serde(default)]
+        preroll_ms: u32,
+    },
+}
+
+fn default_tcp_queue() -> usize {
+    500
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,13 +262,40 @@ impl Config {
         if !(-24..=24).contains(&self.ensemble.local_time_offset_half_hours) {
             bail!("ensemble.local_time_offset_half_hours must be -24..=24");
         }
+        if self.ensemble.local_time_offset_auto && self.ensemble.local_time_offset_half_hours != 0 {
+            bail!("set either automatic or fixed local time offset");
+        }
+        if self.ensemble.tist_offset_ms.unsigned_abs() > 60_000 {
+            bail!("ensemble.tist_offset_ms must be within one minute");
+        }
+        if self.ensemble.tist_at_fct0_ms >= 1000 {
+            bail!("ensemble.tist_at_fct0_ms must be below 1000");
+        }
         if let Some(counter) = self.ensemble.reconfiguration_counter {
             if counter > 1023 || self.services.len() > 63 {
                 bail!("invalid reconfiguration counter or service count");
             }
         }
-        if self.ensemble.tist && !matches!(self.ensemble.tai_utc_offset, Some(32..=255)) {
-            bail!("ensemble.tist requires tai_utc_offset >= 32");
+        if self.ensemble.tist
+            && !matches!(self.ensemble.tai_utc_offset, Some(32..=255))
+            && self.ensemble.tai_clock_bulletins.is_none()
+        {
+            bail!("ensemble.tist requires tai_utc_offset or tai_clock_bulletins");
+        }
+        if self
+            .ensemble
+            .tai_utc_offset
+            .is_some_and(|offset| offset < 32)
+        {
+            bail!("ensemble.tai_utc_offset must be at least 32");
+        }
+        if let Some(urls) = &self.ensemble.tai_clock_bulletins {
+            if urls
+                .split('|')
+                .any(|url| !url.starts_with("https://") || url.len() < 10)
+            {
+                bail!("tai_clock_bulletins must contain HTTPS URLs separated by pipes");
+            }
         }
         validate_label("ensemble.label", &self.ensemble.label)?;
         short_label_mask(
@@ -250,12 +315,18 @@ impl Config {
         if self.output.destinations.is_empty() {
             bail!("at least one EDI destination is required");
         }
+        if !matches!(self.output.tagpacket_alignment, 8 | 16) {
+            bail!("output.tagpacket_alignment must be 8 or 16");
+        }
 
         let mut service_uids = HashSet::new();
         let mut service_ids = HashSet::new();
         for service in &self.services {
             validate_uid("service", &service.uid)?;
             validate_label("service.label", &service.label)?;
+            if service.pty > 31 {
+                bail!("service {} pty must be 0..=31", service.uid);
+            }
             short_label_mask(
                 "service.short_label",
                 &service.label,
@@ -396,6 +467,12 @@ impl Config {
                     component.subchannel
                 );
             }
+            if component.user_applications.len() > 1 {
+                bail!(
+                    "component {} supports one slideshow application",
+                    component.uid
+                );
+            }
             linked_services.insert(component.service.as_str());
         }
         for service in &self.services {
@@ -422,13 +499,25 @@ impl Config {
                         bail!("EDI UDP destination needs an IP address and nonzero port");
                     }
                 }
-                EdiDestination::Tcp { listen_port } if *listen_port == 0 => {
+                EdiDestination::Tcp { listen_port, .. } if *listen_port == 0 => {
                     bail!("EDI TCP listen_port must be nonzero")
                 }
-                EdiDestination::Tcp { listen_port } if tcp_input_ports.contains(listen_port) => {
+                EdiDestination::Tcp { listen_port, .. }
+                    if tcp_input_ports.contains(listen_port) =>
+                {
                     bail!("EDI TCP output port conflicts with an input endpoint")
                 }
-                EdiDestination::Tcp { listen_port } => {
+                EdiDestination::Tcp {
+                    listen_port,
+                    max_frames_queued,
+                    preroll_ms,
+                } => {
+                    if !(1..=10_000).contains(max_frames_queued)
+                        || *preroll_ms > 30_000
+                        || usize::try_from(preroll_ms.div_ceil(24))? > *max_frames_queued
+                    {
+                        bail!("invalid EDI TCP queue or preroll setting");
+                    }
                     if !tcp_output_ports.insert(*listen_port) {
                         bail!("duplicate EDI TCP output port: {listen_port}");
                     }
@@ -571,6 +660,7 @@ mod tests {
             uid: "component_two".into(),
             service: "radio_one".into(),
             subchannel: "audio_two".into(),
+            user_applications: Vec::new(),
         });
         let valid = config.validate().unwrap();
         assert_eq!(valid.subchannels[0].start_address_cu, 0);
@@ -647,8 +737,16 @@ mod tests {
 
         let mut config = example();
         config.output.destinations = vec![
-            EdiDestination::Tcp { listen_port: 9001 },
-            EdiDestination::Tcp { listen_port: 9001 },
+            EdiDestination::Tcp {
+                listen_port: 9001,
+                max_frames_queued: 500,
+                preroll_ms: 0,
+            },
+            EdiDestination::Tcp {
+                listen_port: 9001,
+                max_frames_queued: 500,
+                preroll_ms: 0,
+            },
         ];
         assert!(config
             .validate()
@@ -674,6 +772,22 @@ mod tests {
         assert!(short_label_mask("short_label", "HELIUM RND-004", Some("HRND-004")).is_ok());
         assert!(short_label_mask("short_label", "Radio One", Some("Other")).is_err());
         assert!(short_label_mask("short_label", "Radio One", Some("Radio One")).is_err());
+    }
+
+    #[test]
+    fn supplied_production_config_converts_to_valid_rust_yaml() {
+        let config: Config =
+            serde_yaml::from_str(include_str!("../config.production.example.yaml")).unwrap();
+        let valid = config.validate().unwrap();
+        assert_eq!(valid.source.services.len(), 12);
+        assert_eq!(valid.source.components.len(), 12);
+        assert_eq!(valid.subchannels.len(), 12);
+        assert_eq!(
+            valid.subchannels.iter().map(|sub| sub.size_cu).sum::<u16>(),
+            552
+        );
+        assert_eq!(valid.source.ensemble.tist_offset_ms, 2000);
+        assert_eq!(valid.source.output.tagpacket_alignment, 16);
     }
 
     #[tokio::test]

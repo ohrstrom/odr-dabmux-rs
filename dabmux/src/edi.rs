@@ -48,9 +48,23 @@ pub struct AfPacket {
 
 impl AfPacket {
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_with_alignment(8)
+    }
+
+    pub fn encode_with_alignment(&self, alignment: u8) -> Result<Vec<u8>> {
+        if !matches!(alignment, 8 | 16) {
+            bail!("TAG packet alignment must be 8 or 16");
+        }
         let mut payload = Vec::new();
         for tag in &self.tags {
             tag.encode(&mut payload)?;
+        }
+        if alignment == 16 {
+            Tag {
+                name: *b"*dmy",
+                value: vec![0; 8],
+            }
+            .encode(&mut payload)?;
         }
         payload.resize(payload.len().div_ceil(8) * 8, 0);
         if payload.len() > MAX_AF_PAYLOAD {
@@ -72,8 +86,8 @@ impl AfPacket {
             bail!("invalid AF header");
         }
         let len = u32::from_be_bytes(data[2..6].try_into()?) as usize;
-        if len > MAX_AF_PAYLOAD || !len.is_multiple_of(8) || data.len() != 12 + len {
-            bail!("invalid AF length");
+        if len > MAX_AF_PAYLOAD || data.len() != 12 + len {
+            bail!("invalid AF length: {}", len);
         }
         if data[8] != 0x90 || data[9] != b'T' {
             bail!("unsupported AF revision or payload type");
@@ -431,6 +445,48 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("CRC"));
+    }
+
+    #[test]
+    fn af_accepts_unpadded_audio_encoder_tag_payload() {
+        let packet = AfPacket {
+            sequence: 7,
+            tags: vec![
+                pointer_tag(*b"DSTI"),
+                Tag {
+                    name: *b"dsti",
+                    value: vec![0, 1],
+                },
+                Tag {
+                    name: [b's', b's', 0, 1],
+                    value: vec![0x5a; 231],
+                },
+            ],
+        };
+        let mut payload = Vec::new();
+        for tag in &packet.tags {
+            tag.encode(&mut payload).unwrap();
+        }
+        assert_eq!(payload.len(), 265);
+        let mut bytes = b"AF".to_vec();
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&packet.sequence.to_be_bytes());
+        bytes.extend_from_slice(&[0x90, b'T']);
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&crc16(&bytes).to_be_bytes());
+        assert_eq!(AfPacket::decode(&bytes).unwrap(), packet);
+    }
+
+    #[test]
+    fn sixteen_byte_alignment_appends_dmy_tag() {
+        let packet = AfPacket {
+            sequence: 1,
+            tags: vec![pointer_tag(*b"DETI")],
+        };
+        let encoded = packet.encode_with_alignment(16).unwrap();
+        let decoded = AfPacket::decode(&encoded).unwrap();
+        assert_eq!(decoded.tags.last().unwrap().name, *b"*dmy");
+        assert_eq!(decoded.tags.last().unwrap().value.len(), 8);
     }
 
     #[test]

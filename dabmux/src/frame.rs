@@ -24,6 +24,20 @@ impl FrameClock {
         )
     }
 
+    /// Align wall time to the C++ 24 ms PPS grid and choose the matching FCT phase.
+    pub fn from_wall_time(unix_millis: u64, tist_at_fct0_ms: u16) -> Result<Self> {
+        if tist_at_fct0_ms >= 1000 {
+            bail!("TIST at FCT zero must be below one second");
+        }
+        let seconds = unix_millis / 1000;
+        let rounded = ((unix_millis % 1000 + 12) / FRAME_PERIOD_MS) * FRAME_PERIOD_MS;
+        let absolute = seconds * 1000 + rounded;
+        let offset_count = rounded / FRAME_PERIOD_MS;
+        let counter_offset = u64::from(tist_at_fct0_ms) / FRAME_PERIOD_MS;
+        let count = (250 - counter_offset + offset_count) % 250;
+        Self::new(count, (absolute / 1000) as i64, (absolute % 1000) as u16)
+    }
+
     pub fn new(count: u64, unix_seconds: i64, millisecond: u16) -> Result<Self> {
         if millisecond >= 1000 {
             bail!("millisecond offset must be below 1000");
@@ -42,6 +56,28 @@ impl FrameClock {
             self.millisecond -= 1000;
             self.unix_seconds += 1;
         }
+    }
+
+    pub fn shift_millis(&mut self, delta: i64) -> Result<()> {
+        let millis = self
+            .unix_seconds
+            .checked_mul(1000)
+            .and_then(|value| value.checked_add(i64::from(self.millisecond)))
+            .and_then(|value| value.checked_add(delta))
+            .ok_or_else(|| anyhow::anyhow!("clock offset overflow"))?;
+        self.unix_seconds = millis.div_euclid(1000);
+        self.millisecond = millis.rem_euclid(1000) as u16;
+        Ok(())
+    }
+
+    pub fn rephase_fct0(&mut self, tist_at_fct0_ms: u16) -> Result<()> {
+        if tist_at_fct0_ms >= 1000 {
+            bail!("TIST at FCT zero must be below one second");
+        }
+        let current_count = (u64::from(self.millisecond) + 12) / FRAME_PERIOD_MS;
+        let target_count = u64::from(tist_at_fct0_ms) / FRAME_PERIOD_MS;
+        self.count = self.count / 250 * 250 + (250 - target_count + current_count) % 250;
+        Ok(())
     }
 
     pub fn tsta(&self) -> u32 {
@@ -224,6 +260,33 @@ mod tests {
             (1_704_164_645_999u64 / 24 * 24) as i64
         );
         assert_eq!(clock.count, 1_704_164_645_999 / 24);
+    }
+
+    #[test]
+    fn hot_tist_offset_moves_timestamp_without_resetting_frame_count() {
+        let mut clock = FrameClock::new(250, 1_700_000_000, 992).unwrap();
+        clock.shift_millis(2_000).unwrap();
+        assert_eq!(clock.count, 250);
+        assert_eq!(
+            (clock.unix_seconds, clock.millisecond),
+            (1_700_000_002, 992)
+        );
+        clock.shift_millis(-2_024).unwrap();
+        assert_eq!(
+            (clock.unix_seconds, clock.millisecond),
+            (1_700_000_000, 968)
+        );
+    }
+
+    #[test]
+    fn fct_zero_phase_matches_requested_tist_phase() {
+        let clock = FrameClock::from_wall_time(1_700_000_000_480, 0).unwrap();
+        assert_eq!(clock.fct(), 20);
+        assert_eq!(clock.millisecond, 480);
+        let mut shifted = clock;
+        shifted.rephase_fct0(240).unwrap();
+        assert_eq!(shifted.fct(), 10);
+        assert_eq!(shifted.millisecond, 480);
     }
 
     #[test]

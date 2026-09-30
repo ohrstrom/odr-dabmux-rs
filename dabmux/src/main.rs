@@ -6,6 +6,7 @@ mod api;
 mod config;
 mod fic;
 mod runtime;
+mod timing;
 
 use crate::app::App;
 use crate::args::Args;

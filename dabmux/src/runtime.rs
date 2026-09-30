@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{self, Duration, MissedTickBehavior};
 
 use crate::config::{
@@ -14,6 +15,7 @@ use crate::config::{
     ValidatedConfig,
 };
 use crate::fic::FicCarousel;
+use crate::timing::{TaiClock, TaiSource};
 use dabmux::edi::{
     decode_sti_payload, decode_sti_rtp, fragment_af, pointer_tag, AfPacket, Deti, Est,
     PftReassembler, TimedPayload,
@@ -249,7 +251,7 @@ async fn receive_input_tcp(
 
 async fn serve_edi_tcp(
     listener: Arc<TcpListener>,
-    sender: broadcast::Sender<Vec<u8>>,
+    state: Arc<StdMutex<TcpOutputState>>,
     stats: Arc<RuntimeStats>,
 ) -> Result<()> {
     let mut clients = tokio::task::JoinSet::new();
@@ -258,23 +260,23 @@ async fn serve_edi_tcp(
             accepted = listener.accept() => accepted?,
             _ = clients.join_next(), if !clients.is_empty() => continue,
         };
-        let mut rx = sender.subscribe();
+        let mut rx = {
+            let mut state = state.lock().expect("TCP output state poisoned");
+            let (tx, rx) = mpsc::channel(state.max_queue);
+            for packet in &state.history {
+                tx.try_send(packet.clone())
+                    .expect("validated preroll capacity");
+            }
+            state.clients.push(tx);
+            rx
+        };
         let stats = stats.clone();
         clients.spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(packet) => {
-                        if let Err(err) = client.write_all(&packet).await {
-                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!(%peer, %err, "EDI TCP client disconnected");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+            while let Some(packet) = rx.recv().await {
+                if let Err(err) = client.write_all(&packet).await {
+                    stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%peer, %err, "EDI TCP client disconnected");
+                    break;
                 }
             }
         });
@@ -344,8 +346,38 @@ impl Drop for InputHandle {
 
 struct TcpOutputHandle {
     port: u16,
-    sender: broadcast::Sender<Vec<u8>>,
+    listener: Arc<TcpListener>,
+    max_frames_queued: usize,
+    preroll_ms: u32,
+    state: Arc<StdMutex<TcpOutputState>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct TcpOutputState {
+    clients: Vec<mpsc::Sender<Arc<Vec<u8>>>>,
+    history: VecDeque<Arc<Vec<u8>>>,
+    preroll_frames: usize,
+    max_queue: usize,
+}
+
+impl TcpOutputHandle {
+    fn send(&self, packet: Arc<Vec<u8>>, stats: &RuntimeStats) {
+        let mut state = self.state.lock().expect("TCP output state poisoned");
+        if state.preroll_frames > 0 {
+            state.history.push_back(packet.clone());
+            while state.history.len() > state.preroll_frames {
+                state.history.pop_front();
+            }
+        }
+        state.clients.retain(|client| {
+            if client.try_send(packet.clone()).is_ok() {
+                true
+            } else {
+                stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        });
+    }
 }
 
 impl Drop for TcpOutputHandle {
@@ -358,6 +390,7 @@ impl Drop for TcpOutputHandle {
 struct PreparedResources {
     inputs: HashMap<String, InputSocket>,
     outputs: HashMap<u16, Arc<TcpListener>>,
+    tai_offset: u8,
 }
 
 fn input_key(input: &InputConfig) -> Result<String> {
@@ -373,8 +406,19 @@ async fn prepare_resources(
     candidate: &ValidatedConfig,
     existing_inputs: &HashSet<String>,
     existing_outputs: &HashSet<u16>,
+    current_tai: Option<(TaiSource, u8)>,
 ) -> Result<PreparedResources> {
     let mut prepared = PreparedResources::default();
+    let tai_source = TaiSource::from_config(&candidate.source.ensemble);
+    prepared.tai_offset = if let Some((source, offset)) = current_tai {
+        if source == tai_source {
+            offset
+        } else {
+            tai_source.resolve().await?
+        }
+    } else {
+        tai_source.resolve().await?
+    };
     for sub in &candidate.source.subchannels {
         let key = input_key(&sub.input)?;
         if existing_inputs.contains(&key) || prepared.inputs.contains_key(&key) {
@@ -397,7 +441,7 @@ async fn prepare_resources(
         prepared.inputs.insert(key, socket);
     }
     for destination in &candidate.source.output.destinations {
-        if let EdiDestination::Tcp { listen_port } = destination {
+        if let EdiDestination::Tcp { listen_port, .. } = destination {
             if existing_outputs.contains(listen_port) || prepared.outputs.contains_key(listen_port)
             {
                 continue;
@@ -458,17 +502,31 @@ fn start_input(
 fn start_tcp_output(
     port: u16,
     listener: Arc<TcpListener>,
+    max_frames_queued: usize,
+    preroll_ms: u32,
     stats: Arc<RuntimeStats>,
 ) -> TcpOutputHandle {
-    let (sender, _) = broadcast::channel(16);
-    let task_sender = sender.clone();
+    let state = Arc::new(StdMutex::new(TcpOutputState {
+        clients: Vec::new(),
+        history: VecDeque::new(),
+        preroll_frames: preroll_ms.div_ceil(FRAME_PERIOD_MS as u32) as usize,
+        max_queue: max_frames_queued,
+    }));
+    let task_state = state.clone();
     let task_listener = listener.clone();
     let task = tokio::spawn(async move {
-        if let Err(err) = serve_edi_tcp(task_listener, task_sender, stats).await {
+        if let Err(err) = serve_edi_tcp(task_listener, task_state, stats).await {
             tracing::error!(%err, "EDI TCP server stopped");
         }
     });
-    TcpOutputHandle { port, sender, task }
+    TcpOutputHandle {
+        port,
+        listener,
+        max_frames_queued,
+        preroll_ms,
+        state,
+        task,
+    }
 }
 
 fn commit_resources(
@@ -506,15 +564,38 @@ fn commit_resources(
     for destination in &candidate.source.output.destinations {
         match destination {
             EdiDestination::Udp { address, port } => next_udp.push(format!("{address}:{port}")),
-            EdiDestination::Tcp { listen_port } => {
-                if let Some(position) = outputs.iter().position(|old| old.port == *listen_port) {
+            EdiDestination::Tcp {
+                listen_port,
+                max_frames_queued,
+                preroll_ms,
+            } => {
+                if let Some(position) = outputs.iter().position(|old| {
+                    old.port == *listen_port
+                        && old.max_frames_queued == *max_frames_queued
+                        && old.preroll_ms == *preroll_ms
+                }) {
                     next_outputs.push(outputs.swap_remove(position));
                 } else {
-                    let listener = prepared
-                        .outputs
-                        .remove(listen_port)
-                        .expect("prepared EDI output");
-                    next_outputs.push(start_tcp_output(*listen_port, listener, stats.clone()));
+                    let listener = if let Some(position) =
+                        outputs.iter().position(|old| old.port == *listen_port)
+                    {
+                        let old = outputs.swap_remove(position);
+                        let listener = old.listener.clone();
+                        drop(old);
+                        listener
+                    } else {
+                        prepared
+                            .outputs
+                            .remove(listen_port)
+                            .expect("prepared EDI output")
+                    };
+                    next_outputs.push(start_tcp_output(
+                        *listen_port,
+                        listener,
+                        *max_frames_queued,
+                        *preroll_ms,
+                        stats.clone(),
+                    ));
                 }
             }
         }
@@ -525,7 +606,11 @@ fn commit_resources(
 
 pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
     let initial = config.read().await.clone();
-    let prepared = prepare_resources(&initial, &HashSet::new(), &HashSet::new()).await?;
+    let prepared = prepare_resources(&initial, &HashSet::new(), &HashSet::new(), None).await?;
+    let mut tai_clock = TaiClock::new(
+        TaiSource::from_config(&initial.source.ensemble),
+        prepared.tai_offset,
+    );
     let mut receivers = Vec::new();
     let mut tcp_outputs = Vec::new();
     let mut udp_destinations = Vec::new();
@@ -542,7 +627,13 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
     let (prepared_tx, mut prepared_rx) = mpsc::channel(1);
     config.install_updates(update_tx).await;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let mut clock = FrameClock::from_unix_millis(u64::try_from(now.as_millis())?)?;
+    let shifted_now = i64::try_from(now.as_millis())?
+        .checked_add(i64::from(initial.source.ensemble.tist_offset_ms))
+        .context("TIST startup offset overflow")?;
+    let mut clock = FrameClock::from_wall_time(
+        u64::try_from(shifted_now)?,
+        initial.source.ensemble.tist_at_fct0_ms,
+    )?;
     let mut carousel = FicCarousel::new();
     let mut seq = 0u16;
     let mut tick = time::interval(Duration::from_millis(FRAME_PERIOD_MS));
@@ -558,8 +649,9 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 let input_keys: HashSet<_> = receivers.iter().map(|input: &InputHandle| input.key.clone()).collect();
                 let output_ports: HashSet<_> = tcp_outputs.iter().map(|output: &TcpOutputHandle| output.port).collect();
                 let prepared_tx = prepared_tx.clone();
+                let current_tai = Some((tai_clock.source.clone(), tai_clock.offset()));
                 tokio::spawn(async move {
-                    let result = prepare_resources(&update.candidate, &input_keys, &output_ports).await;
+                    let result = prepare_resources(&update.candidate, &input_keys, &output_ports, current_tai).await;
                     let _ = prepared_tx.send((update, result)).await;
                 });
                 continue;
@@ -589,6 +681,15 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         previous_tick = Some(instant);
         if let Some((update, resources)) = pending.take() {
             let candidate = update.candidate;
+            let new_tai_source = TaiSource::from_config(&candidate.source.ensemble);
+            let new_tai_offset = resources.tai_offset;
+            clock.shift_millis(
+                i64::from(candidate.source.ensemble.tist_offset_ms)
+                    - i64::from(active.source.ensemble.tist_offset_ms),
+            )?;
+            if candidate.source.ensemble.tist_at_fct0_ms != active.source.ensemble.tist_at_fct0_ms {
+                clock.rephase_fct0(candidate.source.ensemble.tist_at_fct0_ms)?;
+            }
             commit_resources(
                 &candidate,
                 resources,
@@ -597,6 +698,9 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 &mut udp_destinations,
                 &stats,
             );
+            if tai_clock.source != new_tai_source {
+                tai_clock = TaiClock::new(new_tai_source, new_tai_offset);
+            }
             active = candidate.clone();
             carousel = FicCarousel::new();
             config.commit(candidate).await;
@@ -652,11 +756,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             _ => unreachable!(),
         };
         let timestamp = if tist {
-            let tai_offset = current
-                .source
-                .ensemble
-                .tai_utc_offset
-                .context("missing TAI-UTC offset")?;
+            let tai_offset = tai_clock.offset();
             let utco = tai_offset - 32;
             let seconds = clock
                 .unix_seconds
@@ -696,7 +796,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             sequence: seq,
             tags,
         }
-        .encode()?;
+        .encode_with_alignment(current.source.output.tagpacket_alignment)?;
         let fragments = fragment_af(&packet, seq)?;
         for destination in &udp_destinations {
             for fragment in &fragments {
@@ -706,8 +806,9 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 }
             }
         }
+        let tcp_packet = Arc::new(packet.clone());
         for output in &tcp_outputs {
-            let _ = output.sender.send(packet.clone());
+            output.send(tcp_packet.clone(), &stats);
         }
         seq = seq.wrapping_add(1);
         clock.tick();

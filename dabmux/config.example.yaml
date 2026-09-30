@@ -13,14 +13,14 @@ services:
 subchannels:
   - uid: audio_one
     id: 1
-    bitrate: 96
+    bitrate: 72
     kind: dab_plus
     protection:
       profile: eep_a
       level: 3
     input:
       protocol: edi
-      uri: udp://127.0.0.1:9000
+      uri: tcp://127.0.0.1:9000
 
 components:
   - uid: component_one
