@@ -1,0 +1,7 @@
+---
+
+services:
+  - sid: 0x4DA4
+    bitrate: 64
+  - sid: 0x4DA5
+    bitrate: 72
