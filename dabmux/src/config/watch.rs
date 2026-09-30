@@ -10,7 +10,12 @@ pub async fn watch_config_file(path: PathBuf, config: SharedConfig) -> anyhow::R
     let path = crate::config::resolve_path(path)?;
     let parent = path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("config path has no parent: {}", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent: {}", path.display()))?
+        .canonicalize()?;
+    let path = parent.join(
+        path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("config path has no file name"))?,
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<Event, notify::Error>>();
 
@@ -20,7 +25,7 @@ pub async fn watch_config_file(path: PathBuf, config: SharedConfig) -> anyhow::R
         },
         notify::Config::default(),
     )?;
-    watcher.watch(parent, RecursiveMode::NonRecursive)?;
+    watcher.watch(&parent, RecursiveMode::NonRecursive)?;
     tracing::info!(
         path = %path.display(),
         "watching config file for changes"
@@ -32,8 +37,13 @@ pub async fn watch_config_file(path: PathBuf, config: SharedConfig) -> anyhow::R
                 if !matches!(
                     event.kind,
                     EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                ) || !event.paths.iter().any(|event_path| event_path == &path)
-                {
+                ) || !event.paths.iter().any(|event_path| {
+                    event_path.file_name() == path.file_name()
+                        && event_path
+                            .parent()
+                            .and_then(|parent| parent.canonicalize().ok())
+                            .is_some_and(|event_parent| event_parent == parent)
+                }) {
                     continue;
                 }
 

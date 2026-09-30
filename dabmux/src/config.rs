@@ -4,57 +4,66 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 pub mod reload;
 pub mod watch;
 
+pub struct ConfigUpdate {
+    pub candidate: ValidatedConfig,
+    pub reply: oneshot::Sender<anyhow::Result<bool>>,
+}
+
 #[derive(Clone)]
-pub struct SharedConfig(Arc<RwLock<ValidatedConfig>>);
+pub struct SharedConfig {
+    active: Arc<RwLock<ValidatedConfig>>,
+    updates: Arc<Mutex<Option<mpsc::Sender<ConfigUpdate>>>>,
+    update_lock: Arc<Mutex<()>>,
+}
 
 impl SharedConfig {
     pub fn new(config: ValidatedConfig) -> Self {
-        Self(Arc::new(RwLock::new(config)))
+        Self {
+            active: Arc::new(RwLock::new(config)),
+            updates: Arc::new(Mutex::new(None)),
+            update_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, ValidatedConfig> {
-        self.0.read().await
+        self.active.read().await
     }
 
-    async fn replace_if_changed(&self, config: ValidatedConfig) -> anyhow::Result<bool> {
-        let mut current = self.0.write().await;
-        if *current == config {
+    pub async fn install_updates(&self, sender: mpsc::Sender<ConfigUpdate>) {
+        *self.updates.lock().await = Some(sender);
+    }
+
+    pub async fn commit(&self, config: ValidatedConfig) {
+        *self.active.write().await = config;
+    }
+
+    pub async fn replace_if_changed(&self, config: ValidatedConfig) -> anyhow::Result<bool> {
+        let _guard = self.update_lock.lock().await;
+        if *self.active.read().await == config {
             return Ok(false);
         }
-        let old = &current.source;
-        let new = &config.source;
-        if old.ensemble.id != new.ensemble.id
-            || old.ensemble.ecc != new.ensemble.ecc
-            || old.ensemble.mode != new.ensemble.mode
-            || old.ensemble.local_time_offset_half_hours
-                != new.ensemble.local_time_offset_half_hours
-            || old.ensemble.international_table != new.ensemble.international_table
-            || old.ensemble.reconfiguration_counter != new.ensemble.reconfiguration_counter
-            || old.ensemble.tist != new.ensemble.tist
-            || old.ensemble.tai_utc_offset != new.ensemble.tai_utc_offset
-            || old.subchannels != new.subchannels
-            || old.components != new.components
-            || old.output != new.output
-            || old
-                .services
-                .iter()
-                .map(|s| (&s.uid, s.id))
-                .collect::<Vec<_>>()
-                != new
-                    .services
-                    .iter()
-                    .map(|s| (&s.uid, s.id))
-                    .collect::<Vec<_>>()
-        {
-            bail!("this config change requires a mux restart; only labels can reload live");
-        }
-        *current = config;
-        Ok(true)
+        let sender = self
+            .updates
+            .lock()
+            .await
+            .clone()
+            .context("mux runtime is not ready for config updates")?;
+        let (reply, result) = oneshot::channel();
+        sender
+            .send(ConfigUpdate {
+                candidate: config,
+                reply,
+            })
+            .await
+            .context("mux runtime stopped accepting config updates")?;
+        result
+            .await
+            .context("mux runtime stopped during config update")?
     }
 
     pub async fn apply(&self, candidate: Config) -> anyhow::Result<bool> {
@@ -256,6 +265,8 @@ impl Config {
 
         let mut subchannel_uids = HashSet::new();
         let mut subchannel_ids = HashSet::new();
+        let mut input_endpoints = HashSet::new();
+        let mut tcp_input_ports = HashSet::new();
         let mut validated = Vec::with_capacity(self.subchannels.len());
         let mut next_cu: u16 = 0;
         let mut payload_words = 0usize;
@@ -297,12 +308,23 @@ impl Config {
             } else {
                 address.to_owned()
             };
-            address.parse::<std::net::SocketAddr>().with_context(|| {
+            let socket_address = address.parse::<std::net::SocketAddr>().with_context(|| {
                 format!(
                     "subchannel {} input URI needs an IP address and port",
                     sub.uid
                 )
             })?;
+            let transport = if uri.starts_with("tcp://") {
+                "tcp"
+            } else {
+                "udp"
+            };
+            if !input_endpoints.insert(format!("{transport}://{socket_address}")) {
+                bail!("duplicate input endpoint: {uri}");
+            }
+            if transport == "tcp" {
+                tcp_input_ports.insert(socket_address.port());
+            }
             if let InputConfig::Edi {
                 stream_index,
                 buffer_frames,
@@ -380,6 +402,7 @@ impl Config {
                 );
             }
         }
+        let mut tcp_output_ports = HashSet::new();
         for destination in &self.output.destinations {
             match destination {
                 EdiDestination::Udp { address, port } => {
@@ -390,7 +413,14 @@ impl Config {
                 EdiDestination::Tcp { listen_port } if *listen_port == 0 => {
                     bail!("EDI TCP listen_port must be nonzero")
                 }
-                EdiDestination::Tcp { .. } => {}
+                EdiDestination::Tcp { listen_port } if tcp_input_ports.contains(listen_port) => {
+                    bail!("EDI TCP output port conflicts with an input endpoint")
+                }
+                EdiDestination::Tcp { listen_port } => {
+                    if !tcp_output_ports.insert(*listen_port) {
+                        bail!("duplicate EDI TCP output port: {listen_port}");
+                    }
+                }
             }
         }
         let fic_words = if mode == 3 { 32 } else { 24 };
@@ -484,7 +514,7 @@ mod tests {
     use super::*;
 
     fn example() -> Config {
-        serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap()
+        serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap()
     }
 
     #[test]
@@ -565,6 +595,31 @@ mod tests {
             .contains("level must be 1..=4"));
     }
 
+    #[test]
+    fn duplicate_bindings_are_rejected_before_activation() {
+        let mut config = example();
+        let mut second = config.subchannels[0].clone();
+        second.uid = "audio_two".into();
+        second.id = 2;
+        config.subchannels.push(second);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate input endpoint"));
+
+        let mut config = example();
+        config.output.destinations = vec![
+            EdiDestination::Tcp { listen_port: 9001 },
+            EdiDestination::Tcp { listen_port: 9001 },
+        ];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate EDI TCP output port"));
+    }
+
     #[tokio::test]
     async fn invalid_candidate_does_not_replace_active_config() {
         let initial = example().validate().unwrap();
@@ -574,17 +629,22 @@ mod tests {
         assert!(invalid.validate().is_err());
         assert_eq!(*shared.read().await, initial);
 
+        let (tx, mut rx) = mpsc::channel(1);
+        shared.install_updates(tx).await;
+        let worker = shared.clone();
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                worker.commit(update.candidate).await;
+                let _ = update.reply.send(Ok(true));
+            }
+        });
         let mut changed = example();
         changed.services[0].label = "New Label".into();
         assert!(shared.apply(changed).await.unwrap());
         assert_eq!(shared.read().await.source.services[0].label, "New Label");
         let mut layout_change = example();
         layout_change.subchannels[0].bitrate = 104;
-        assert!(shared
-            .apply(layout_change)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("restart"));
+        assert!(shared.apply(layout_change).await.unwrap());
+        assert_eq!(shared.read().await.subchannels[0].bitrate, 104);
     }
 }

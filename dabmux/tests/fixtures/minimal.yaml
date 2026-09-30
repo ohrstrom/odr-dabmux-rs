@@ -7,8 +7,8 @@ ensemble:
 
 services:
   - uid: radio_one
-    id: 19875
-    label: Radio X
+    id: 19876
+    label: Radio One
 
 subchannels:
   - uid: audio_one
@@ -29,5 +29,6 @@ components:
 
 output:
   destinations:
-    - protocol: tcp
-      listen_port: 9001
+    - protocol: udp
+      address: 127.0.0.1
+      port: 9001

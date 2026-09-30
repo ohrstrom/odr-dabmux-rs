@@ -219,7 +219,8 @@ mod tests {
 
     #[test]
     fn writes_three_crc_protected_fibs() {
-        let config: Config = serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+        let config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
         let valid = config.validate().unwrap();
         let mut carousel = FicCarousel::new();
         let fibs = carousel
@@ -238,7 +239,7 @@ mod tests {
     #[test]
     fn packs_multiple_services_into_fig_zero_two() {
         let mut config: Config =
-            serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
         config.services.push(crate::config::ServiceConfig {
             uid: "radio_two".into(),
             id: 0x4da5,
@@ -265,7 +266,7 @@ mod tests {
     #[test]
     fn reconfiguration_counter_follows_ensemble_identity() {
         let mut config: Config =
-            serde_yaml::from_str(include_str!("../config.example.yaml")).unwrap();
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
         config.ensemble.reconfiguration_counter = Some(0x123);
         let mut carousel = FicCarousel::new();
         let fibs = carousel
