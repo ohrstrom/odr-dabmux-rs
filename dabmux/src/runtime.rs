@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +28,7 @@ pub struct RuntimeStats {
     pub config_activations: AtomicU64,
     pub input_underflows: AtomicU64,
     pub input_drops: AtomicU64,
+    pub input_size_mismatches: AtomicU64,
     pub decode_errors: AtomicU64,
     pub send_errors: AtomicU64,
     pub missed_ticks: AtomicU64,
@@ -43,6 +44,7 @@ impl RuntimeStats {
             config_activations: self.config_activations.load(Ordering::Relaxed),
             input_underflows: self.input_underflows.load(Ordering::Relaxed),
             input_drops: self.input_drops.load(Ordering::Relaxed),
+            input_size_mismatches: self.input_size_mismatches.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
             missed_ticks: self.missed_ticks.load(Ordering::Relaxed),
@@ -59,6 +61,7 @@ pub struct StatsSnapshot {
     config_activations: u64,
     input_underflows: u64,
     input_drops: u64,
+    input_size_mismatches: u64,
     decode_errors: u64,
     send_errors: u64,
     missed_ticks: u64,
@@ -208,10 +211,14 @@ fn bind_address(input: &InputConfig) -> Result<String> {
 async fn receive_input_tcp(
     listener: Arc<TcpListener>,
     stream_index: u16,
+    expected_bytes: usize,
     tx: mpsc::Sender<TimedPayload>,
     stats: Arc<RuntimeStats>,
 ) -> Result<()> {
     let mut clients = tokio::task::JoinSet::new();
+    let active_client = Arc::new(AtomicU64::new(0));
+    let mismatch_warned = Arc::new(AtomicBool::new(false));
+    let mut next_client_id = 1u64;
     loop {
         let (mut stream, peer) = tokio::select! {
             accepted = listener.accept() => accepted?,
@@ -219,6 +226,10 @@ async fn receive_input_tcp(
         };
         let tx = tx.clone();
         let stats = stats.clone();
+        let active_client = active_client.clone();
+        let mismatch_warned = mismatch_warned.clone();
+        let client_id = next_client_id;
+        next_client_id = next_client_id.wrapping_add(1).max(1);
         clients.spawn(async move {
             loop {
                 let mut header = [0u8; 10];
@@ -240,6 +251,30 @@ async fn receive_input_tcp(
                 }
                 match AfPacket::decode(&packet).and_then(|p| decode_sti_payload(&p, stream_index)) {
                     Ok(payload) => {
+                        if payload.bytes.len() != expected_bytes {
+                            stats
+                                .input_size_mismatches
+                                .fetch_add(1, Ordering::Relaxed);
+                            if !mismatch_warned.swap(true, Ordering::Relaxed) {
+                                tracing::warn!(%peer, received_bytes = payload.bytes.len(), expected_bytes, "TCP EDI producer bitrate does not match subchannel; closing connection");
+                            }
+                            break;
+                        }
+                        let owner = active_client.load(Ordering::Acquire);
+                        if owner != client_id
+                            && (owner != 0
+                                || active_client
+                                    .compare_exchange(
+                                        0,
+                                        client_id,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_err())
+                        {
+                            tracing::debug!(%peer, "ignoring additional TCP EDI producer");
+                            break;
+                        }
                         if tx.send(payload).await.is_err() {
                             break;
                         }
@@ -250,6 +285,12 @@ async fn receive_input_tcp(
                     }
                 }
             }
+            let _ = active_client.compare_exchange(
+                client_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
         });
     }
 }
@@ -291,6 +332,7 @@ async fn serve_edi_tcp(
 async fn receive_input(
     input: InputConfig,
     socket: Arc<UdpSocket>,
+    expected_bytes: usize,
     tx: mpsc::Sender<TimedPayload>,
     stats: Arc<RuntimeStats>,
 ) -> Result<()> {
@@ -301,6 +343,7 @@ async fn receive_input(
     };
     let mut buf = vec![0u8; 65536];
     let mut pft = PftReassembler::default();
+    let mut mismatch_warned = false;
     loop {
         let (size, _) = socket.recv_from(&mut buf).await?;
         let payload = match &input {
@@ -316,6 +359,14 @@ async fn receive_input(
         };
         match payload {
             Ok(Some(Ok(payload))) => {
+                if payload.bytes.len() != expected_bytes {
+                    stats.input_size_mismatches.fetch_add(1, Ordering::Relaxed);
+                    if !mismatch_warned {
+                        tracing::warn!(%address, received_bytes = payload.bytes.len(), expected_bytes, "input bitrate does not match subchannel; discarding frame");
+                        mismatch_warned = true;
+                    }
+                    continue;
+                }
                 if tx.try_send(payload).is_err() {
                     stats.input_drops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -341,6 +392,7 @@ struct InputHandle {
     socket: InputSocket,
     task: tokio::task::JoinHandle<()>,
     buffered: BufferedInput,
+    underflowing: bool,
 }
 
 impl Drop for InputHandle {
@@ -366,6 +418,14 @@ struct TcpOutputState {
 }
 
 impl TcpOutputHandle {
+    fn clear_history(&self) {
+        self.state
+            .lock()
+            .expect("TCP output state poisoned")
+            .history
+            .clear();
+    }
+
     fn send(&self, packet: Arc<Vec<u8>>, stats: &RuntimeStats) {
         let mut state = self.state.lock().expect("TCP output state poisoned");
         if state.preroll_frames > 0 {
@@ -477,6 +537,7 @@ fn start_input(
     };
     let (tx, rx) = mpsc::channel(buffer_size);
     let buffered = BufferedInput::new(rx, &input);
+    let expected_bytes = subchannel.bitrate as usize * 3;
     let task = match socket.clone() {
         InputSocket::Tcp(listener) => {
             let stream_index = match &input {
@@ -484,13 +545,15 @@ fn start_input(
                 _ => unreachable!(),
             };
             tokio::spawn(async move {
-                if let Err(err) = receive_input_tcp(listener, stream_index, tx, stats).await {
+                if let Err(err) =
+                    receive_input_tcp(listener, stream_index, expected_bytes, tx, stats).await
+                {
                     tracing::error!(%err, "EDI TCP receiver stopped");
                 }
             })
         }
         InputSocket::Udp(socket) => tokio::spawn(async move {
-            if let Err(err) = receive_input(input, socket, tx, stats).await {
+            if let Err(err) = receive_input(input, socket, expected_bytes, tx, stats).await {
                 tracing::error!(%err, "input receiver stopped");
             }
         }),
@@ -501,6 +564,7 @@ fn start_input(
         socket,
         task,
         buffered,
+        underflowing: false,
     }
 }
 
@@ -686,6 +750,21 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         previous_tick = Some(instant);
         if let Some((update, resources)) = pending.take() {
             let candidate = update.candidate;
+            let structure_changed = candidate.subchannels != active.subchannels
+                || candidate.source.components != active.source.components
+                || candidate.source.ensemble.id != active.source.ensemble.id
+                || candidate
+                    .source
+                    .services
+                    .iter()
+                    .map(|service| (service.uid.as_str(), service.id))
+                    .collect::<Vec<_>>()
+                    != active
+                        .source
+                        .services
+                        .iter()
+                        .map(|service| (service.uid.as_str(), service.id))
+                        .collect::<Vec<_>>();
             let new_tai_source = TaiSource::from_config(&candidate.source.ensemble);
             let new_tai_offset = resources.tai_offset;
             clock.shift_millis(
@@ -703,6 +782,12 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 &mut udp_destinations,
                 &stats,
             );
+            if structure_changed {
+                for output in &tcp_outputs {
+                    output.clear_history();
+                }
+                tracing::warn!("ensemble structure changed; TCP preroll cleared; receivers may need to reacquire");
+            }
             if tai_clock.source != new_tai_source {
                 tai_clock = TaiClock::new(new_tai_source, new_tai_offset);
             }
@@ -718,9 +803,19 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         let mut payloads = Vec::with_capacity(current.subchannels.len());
         for (sub, input) in current.subchannels.iter().zip(&mut receivers) {
             let data = match input.buffered.take(clock, &stats) {
-                Some(data) if data.len() == sub.payload_bytes => data,
-                Some(_) | None => {
+                Some(data) if data.len() == sub.payload_bytes => {
+                    if input.underflowing {
+                        tracing::info!(subchannel = %sub.uid, "input recovered");
+                        input.underflowing = false;
+                    }
+                    data
+                }
+                data => {
                     stats.input_underflows.fetch_add(1, Ordering::Relaxed);
+                    if !input.underflowing {
+                        tracing::warn!(subchannel = %sub.uid, received_bytes = ?data.as_ref().map(Vec::len), expected_bytes = sub.payload_bytes, "input underflow; substituting silence");
+                        input.underflowing = true;
+                    }
                     vec![0u8; sub.payload_bytes]
                 }
             };
