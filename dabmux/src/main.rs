@@ -4,6 +4,8 @@ mod tracing;
 
 mod api;
 mod config;
+mod fic;
+mod runtime;
 
 use crate::app::App;
 use crate::args::Args;

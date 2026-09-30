@@ -1,7 +1,33 @@
----
+ensemble:
+  id: 20479
+  ecc: 225
+  label: Example Mux
+  mode: 1
+  tist: false
 
 services:
-  - sid: 0x4DA4
-    bitrate: 64
-  - sid: 0x4DA5
-    bitrate: 72
+  - uid: radio_one
+    id: 19876
+    label: Radio X
+
+subchannels:
+  - uid: audio_one
+    id: 1
+    bitrate: 96
+    kind: dab_plus
+    protection:
+      profile: eep_a
+      level: 3
+    input:
+      protocol: edi
+      uri: udp://127.0.0.1:9000
+
+components:
+  - uid: component_one
+    service: radio_one
+    subchannel: audio_one
+
+output:
+  destinations:
+    - protocol: tcp
+      listen_port: 9001
