@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["dabmux"]
+
+[profile.release]
+opt-level = "z"
+lto = true
