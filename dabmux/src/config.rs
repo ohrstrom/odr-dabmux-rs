@@ -178,10 +178,84 @@ pub enum InputConfig {
         prebuffer_frames: usize,
         #[serde(default)]
         timing: InputTiming,
+        /// TCP only, on by default: stop reading while the buffer is full so
+        /// the producer is throttled, which unpaced file encoders need. Set
+        /// `false` for live encoders to drop the oldest frame instead, so that
+        /// clock drift cannot grow latency without bound.
+        #[serde(default)]
+        backpressure: Option<bool>,
     },
     Sti {
         uri: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Transport {
+    Udp,
+    Tcp,
+}
+
+/// Local socket an input listens on, resolved once from its URI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InputEndpoint {
+    pub transport: Transport,
+    pub address: std::net::SocketAddr,
+}
+
+impl std::fmt::Display for InputEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let scheme = match self.transport {
+            Transport::Udp => "udp",
+            Transport::Tcp => "tcp",
+        };
+        write!(f, "{scheme}://{}", self.address)
+    }
+}
+
+impl InputConfig {
+    pub fn uri(&self) -> &str {
+        match self {
+            Self::Edi { uri, .. } | Self::Sti { uri } => uri,
+        }
+    }
+
+    pub fn endpoint(&self) -> anyhow::Result<InputEndpoint> {
+        let uri = self.uri();
+        let (transport, address) = match self {
+            Self::Edi { .. } => match (uri.strip_prefix("udp://"), uri.strip_prefix("tcp://")) {
+                (Some(address), _) => (Transport::Udp, address),
+                (_, Some(address)) => (Transport::Tcp, address),
+                _ => bail!("EDI input URI must start with udp:// or tcp://"),
+            },
+            Self::Sti { .. } => (
+                Transport::Udp,
+                uri.strip_prefix("rtp://")
+                    .context("STI input URI must start with rtp://")?,
+            ),
+        };
+        let address = if address.starts_with(':') {
+            format!("0.0.0.0{address}")
+        } else {
+            address.to_owned()
+        };
+        let address = address
+            .parse()
+            .context("input URI needs an IP address and port")?;
+        Ok(InputEndpoint { transport, address })
+    }
+
+    /// Whether a full buffer should stall the producer instead of dropping.
+    /// Defaults to on for TCP; UDP and STI inputs cannot be throttled.
+    pub fn backpressure(&self) -> bool {
+        match self {
+            Self::Edi { backpressure, .. } => backpressure.unwrap_or_else(|| {
+                self.endpoint()
+                    .is_ok_and(|endpoint| endpoint.transport == Transport::Tcp)
+            }),
+            Self::Sti { .. } => false,
+        }
+    }
 }
 
 fn default_stream_index() -> u16 {
@@ -238,6 +312,8 @@ fn default_tcp_queue() -> usize {
 pub struct ValidatedConfig {
     pub source: Config,
     pub subchannels: Vec<ValidatedSubchannel>,
+    /// Components in config order, with references resolved to indices.
+    pub components: Vec<ValidatedComponent>,
     pub fic_words: usize,
     pub frame_words: usize,
 }
@@ -251,6 +327,23 @@ pub struct ValidatedSubchannel {
     pub size_cu: u16,
     pub payload_bytes: usize,
     pub tpl: u8,
+    pub endpoint: InputEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedComponent {
+    /// Index into `source.services`.
+    pub service: usize,
+    /// Index into `subchannels` and `source.subchannels`.
+    pub subchannel: usize,
+    /// Position within the service; 0 is the primary component.
+    pub scids: u8,
+}
+
+impl ValidatedConfig {
+    pub fn service_components(&self, service: usize) -> impl Iterator<Item = &ValidatedComponent> {
+        self.components.iter().filter(move |c| c.service == service)
+    }
 }
 
 impl Config {
@@ -374,39 +467,23 @@ impl Config {
             }
             let bytes = usize::from(sub.bitrate) * 3;
             payload_words += bytes / 4;
-            let uri = match &sub.input {
-                InputConfig::Edi { uri, .. } | InputConfig::Sti { uri } => uri,
-            };
-            let address = match &sub.input {
-                InputConfig::Edi { .. } => uri
-                    .strip_prefix("udp://")
-                    .or_else(|| uri.strip_prefix("tcp://")),
-                InputConfig::Sti { .. } => uri.strip_prefix("rtp://"),
+            let endpoint = sub
+                .input
+                .endpoint()
+                .with_context(|| format!("subchannel {} input", sub.uid))?;
+            if !input_endpoints.insert(endpoint) {
+                bail!("duplicate input endpoint: {}", sub.input.uri());
             }
-            .ok_or_else(|| {
-                anyhow::anyhow!("subchannel {} input URI has unsupported transport", sub.uid)
-            })?;
-            let address = if address.starts_with(':') {
-                format!("0.0.0.0{address}")
-            } else {
-                address.to_owned()
-            };
-            let socket_address = address.parse::<std::net::SocketAddr>().with_context(|| {
-                format!(
-                    "subchannel {} input URI needs an IP address and port",
-                    sub.uid
-                )
-            })?;
-            let transport = if uri.starts_with("tcp://") {
-                "tcp"
-            } else {
-                "udp"
-            };
-            if !input_endpoints.insert(format!("{transport}://{socket_address}")) {
-                bail!("duplicate input endpoint: {uri}");
-            }
-            if transport == "tcp" {
-                tcp_input_ports.insert(socket_address.port());
+            if endpoint.transport == Transport::Tcp {
+                tcp_input_ports.insert(endpoint.address.port());
+            } else if matches!(
+                sub.input,
+                InputConfig::Edi {
+                    backpressure: Some(true),
+                    ..
+                }
+            ) {
+                bail!("subchannel {} backpressure requires a TCP input", sub.uid);
             }
             if let InputConfig::Edi {
                 stream_index,
@@ -442,12 +519,15 @@ impl Config {
                 size_cu: size,
                 payload_bytes: bytes,
                 tpl,
+                endpoint,
             });
             next_cu = end;
         }
 
         let mut component_uids = HashSet::new();
         let mut linked_services = HashSet::new();
+        let mut components = Vec::with_capacity(self.components.len());
+        let mut subchannel_languages = std::collections::HashMap::new();
         for component in &self.components {
             validate_uid("component", &component.uid)?;
             if !component_uids.insert(component.uid.as_str()) {
@@ -473,7 +553,45 @@ impl Config {
                     component.uid
                 );
             }
+            let service = self
+                .services
+                .iter()
+                .position(|s| s.uid == component.service)
+                .expect("checked service reference");
+            let subchannel = self
+                .subchannels
+                .iter()
+                .position(|s| s.uid == component.subchannel)
+                .expect("checked subchannel reference");
+            let scids = components
+                .iter()
+                .filter(|c: &&ValidatedComponent| c.service == service)
+                .count();
+            // FIG 0/13 identifies secondary components by SCIdS, which needs
+            // FIG 0/8; only the primary component is addressable without it.
+            if scids > 0 && !component.user_applications.is_empty() {
+                bail!(
+                    "component {} user applications are only supported on a service's first component",
+                    component.uid
+                );
+            }
+            // FIG 0/5 signals language per subchannel.
+            let language = self.services[service].language;
+            if language != 0 {
+                let previous = subchannel_languages.insert(subchannel, language);
+                if previous.is_some_and(|previous| previous != language) {
+                    bail!(
+                        "subchannel {} is shared by services with different languages",
+                        component.subchannel
+                    );
+                }
+            }
             linked_services.insert(component.service.as_str());
+            components.push(ValidatedComponent {
+                service,
+                subchannel,
+                scids: scids as u8,
+            });
         }
         for service in &self.services {
             if !linked_services.contains(service.uid.as_str()) {
@@ -532,6 +650,7 @@ impl Config {
         Ok(ValidatedConfig {
             source: self,
             subchannels: validated,
+            components,
             fic_words,
             frame_words,
         })
@@ -774,6 +893,124 @@ mod tests {
         assert!(short_label_mask("short_label", "HELIUM RND-004", Some("HRND-004")).is_ok());
         assert!(short_label_mask("short_label", "Radio One", Some("Other")).is_err());
         assert!(short_label_mask("short_label", "Radio One", Some("Radio One")).is_err());
+    }
+
+    fn with_second_service_on_shared_subchannel(language: u8) -> Config {
+        let mut config = example();
+        config.services[0].language = 8;
+        config.services.push(ServiceConfig {
+            uid: "radio_two".into(),
+            id: 0x4da5,
+            label: "Radio Two".into(),
+            short_label: None,
+            pty: 0,
+            language,
+        });
+        config.components.push(ComponentConfig {
+            uid: "component_two".into(),
+            service: "radio_two".into(),
+            subchannel: "audio_one".into(),
+            user_applications: Vec::new(),
+        });
+        config
+    }
+
+    #[test]
+    fn shared_subchannel_languages_must_agree() {
+        assert!(with_second_service_on_shared_subchannel(8)
+            .validate()
+            .is_ok());
+        assert!(with_second_service_on_shared_subchannel(0)
+            .validate()
+            .is_ok());
+        assert!(with_second_service_on_shared_subchannel(9)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("different languages"));
+    }
+
+    #[test]
+    fn user_applications_only_on_primary_component() {
+        let mut config = example();
+        config.subchannels.push(SubchannelConfig {
+            uid: "audio_two".into(),
+            id: 2,
+            bitrate: 64,
+            kind: SubchannelKind::DabPlus,
+            protection: ProtectionConfig::EepA { level: 3 },
+            input: InputConfig::Sti {
+                uri: "rtp://127.0.0.1:9002".into(),
+            },
+        });
+        config.components.push(ComponentConfig {
+            uid: "component_two".into(),
+            service: "radio_one".into(),
+            subchannel: "audio_two".into(),
+            user_applications: vec![UserApplication::Slideshow],
+        });
+        assert!(config
+            .clone()
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("first component"));
+        config.components[1].user_applications.clear();
+        let valid = config.validate().unwrap();
+        assert_eq!(
+            valid.components,
+            [
+                ValidatedComponent {
+                    service: 0,
+                    subchannel: 0,
+                    scids: 0
+                },
+                ValidatedComponent {
+                    service: 0,
+                    subchannel: 1,
+                    scids: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_endpoints_are_resolved_once() {
+        let edi = |uri: &str, backpressure: Option<bool>| InputConfig::Edi {
+            uri: uri.into(),
+            stream_index: 1,
+            buffer_frames: 40,
+            prebuffer_frames: 4,
+            timing: InputTiming::Prebuffering,
+            backpressure,
+        };
+        assert_eq!(
+            edi("tcp://:9000", None).endpoint().unwrap().to_string(),
+            "tcp://0.0.0.0:9000"
+        );
+        assert_eq!(
+            InputConfig::Sti {
+                uri: "rtp://127.0.0.1:9002".into()
+            }
+            .endpoint()
+            .unwrap()
+            .transport,
+            Transport::Udp
+        );
+        assert!(edi("http://127.0.0.1:9000", None).endpoint().is_err());
+        assert!(edi("udp://localhost:9000", None).endpoint().is_err());
+
+        assert!(edi("tcp://127.0.0.1:9000", None).backpressure());
+        assert!(!edi("tcp://127.0.0.1:9000", Some(false)).backpressure());
+        assert!(!edi("udp://127.0.0.1:9000", None).backpressure());
+
+        let mut config = example();
+        config.subchannels[0].input = edi("udp://127.0.0.1:9000", Some(true));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("backpressure requires a TCP input"));
     }
 
     #[test]

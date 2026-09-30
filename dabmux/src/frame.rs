@@ -7,6 +7,17 @@ use crate::edi::crc16;
 pub const FRAME_PERIOD_MS: u64 = 24;
 pub const MAX_ETI_BYTES: usize = 6144;
 
+/// CIFs (24 ms ETI frames) per transmission frame: 96 ms in mode I, 48 ms in
+/// mode IV, 24 ms in modes II and III (EN 300 401 Table 2). Frames whose count
+/// is a multiple of this open a transmission frame, matching FP phase 0.
+pub fn cifs_per_transmission_frame(mode: u8) -> u64 {
+    match mode {
+        1 => 4,
+        4 => 2,
+        _ => 1,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameClock {
     pub count: u64,

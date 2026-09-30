@@ -93,6 +93,8 @@ impl Drop for TaiClock {
     }
 }
 
+/// Host timezone offset for FIG 0/9, which can only express half hours.
+/// Offsets such as +5:45 (Nepal) truncate towards zero, to +5:30.
 pub fn local_offset_half_hours(unix_seconds: i64) -> Result<i8> {
     let utc = Utc
         .timestamp_opt(unix_seconds, 0)

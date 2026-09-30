@@ -1,9 +1,19 @@
 //! Initial classic FIC carousel for programme audio ensembles.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{bail, Result};
 
 use crate::config::{encode_label, short_label_mask, SubchannelKind, ValidatedConfig};
-use dabmux::frame::FrameClock;
+use dabmux::frame::{cifs_per_transmission_frame, FrameClock};
+
+/// FIG 0/13 user application type for MOT Slideshow (TS 101 756 Table 16).
+const USER_APPLICATION_SLIDESHOW: u16 = 0x002;
+/// X-PAD application type "MOT, start of X-PAD data group" (EN 300 401 Table 11).
+const XPAD_APPTY_MOT_START: u8 = 12;
+/// Data service component type MOT (TS 101 756 Table 2).
+const DSCTY_MOT: u8 = 60;
 
 pub struct FicCarousel {
     subchannel_cursor: usize,
@@ -13,6 +23,7 @@ pub struct FicCarousel {
     language_cursor: usize,
     pty_cursor: usize,
     application_cursor: usize,
+    reconfiguration_counter: Option<u16>,
 }
 
 impl FicCarousel {
@@ -25,7 +36,15 @@ impl FicCarousel {
             language_cursor: 0,
             pty_cursor: 0,
             application_cursor: 0,
+            reconfiguration_counter: None,
         }
+    }
+
+    /// Signal this FIG 0/7 count instead of the configured one. The runtime
+    /// increments it on structural changes.
+    pub fn with_reconfiguration_counter(mut self, counter: Option<u16>) -> Self {
+        self.reconfiguration_counter = counter;
+        self
     }
 
     pub fn write(&mut self, config: &ValidatedConfig, clock: FrameClock) -> Result<Vec<u8>> {
@@ -37,18 +56,27 @@ impl FicCarousel {
         let mut fibs = vec![[0u8; 30]; fib_count];
         let mut lengths = vec![0usize; fib_count];
 
-        // Ensemble identity always starts FIB 0.
-        push(
-            &mut fibs[0],
-            &mut lengths[0],
-            &fig0_0(config.source.ensemble.id, clock.count),
-        )?;
-        if let Some(counter) = config.source.ensemble.reconfiguration_counter {
+        // FIG 0/0, followed by FIG 0/7, opens FIB 0 of each transmission frame.
+        let mode = config.source.ensemble.mode;
+        if clock
+            .count
+            .is_multiple_of(cifs_per_transmission_frame(mode))
+        {
             push(
                 &mut fibs[0],
                 &mut lengths[0],
-                &fig0_7(counter, config.source.services.len() as u8),
+                &fig0_0(config.source.ensemble.id, clock.count),
             )?;
+            let counter = self
+                .reconfiguration_counter
+                .or(config.source.ensemble.reconfiguration_counter);
+            if let Some(counter) = counter {
+                push(
+                    &mut fibs[0],
+                    &mut lengths[0],
+                    &fig0_7(counter, config.source.services.len() as u8),
+                )?;
+            }
         }
         let mut subch_fig = vec![0, 1];
         let start = self.subchannel_cursor;
@@ -84,30 +112,21 @@ impl FicCarousel {
         let first_service = self.service_cursor;
         loop {
             let service = &config.source.services[self.service_cursor];
-            let components: Vec<_> = config
-                .source
-                .components
-                .iter()
-                .filter(|c| c.service == service.uid)
-                .collect();
+            let components: Vec<_> = config.service_components(self.service_cursor).collect();
             let entry_len = 3 + 2 * components.len();
             if fig.len() + entry_len > 30 {
                 break;
             }
             fig.extend_from_slice(&(service.id as u16).to_be_bytes());
             fig.push(components.len() as u8);
-            for (ix, component) in components.iter().enumerate() {
-                let (sub, raw) = config
-                    .subchannels
-                    .iter()
-                    .zip(&config.source.subchannels)
-                    .find(|(_, raw)| raw.uid == component.subchannel)
-                    .ok_or_else(|| anyhow::anyhow!("unresolved component subchannel"))?;
-                let ascty = match raw.kind {
+            for component in components {
+                let sub = &config.subchannels[component.subchannel];
+                let ascty = match config.source.subchannels[component.subchannel].kind {
                     SubchannelKind::DabPlus => 0x3f,
                     SubchannelKind::MpegAudio => 0,
                 };
-                fig.extend_from_slice(&[ascty, (sub.id << 2) | (u8::from(ix == 0) << 1)]);
+                let primary = u8::from(component.scids == 0);
+                fig.extend_from_slice(&[ascty, (sub.id << 2) | (primary << 1)]);
             }
             self.service_cursor = (self.service_cursor + 1) % config.source.services.len();
             if self.service_cursor == first_service {
@@ -123,7 +142,7 @@ impl FicCarousel {
         // Rotate labels while reserving a periodic slot for UTC time/date.
         if clock.count.is_multiple_of(4) {
             push(&mut fibs[2], &mut lengths[2], &fig0_10(clock))?;
-            push(&mut fibs[2], &mut lengths[2], &fig0_9(config, clock)?)?;
+            push(&mut fibs[2], &mut lengths[2], &fig0_9(config, clock))?;
             if let Some(fig) = self.next_metadata(config) {
                 push(&mut fibs[2], &mut lengths[2], &fig)?;
             }
@@ -146,7 +165,7 @@ impl FicCarousel {
             };
             push(&mut fibs[2], &mut lengths[2], &label_fig)?;
             self.label_cursor = (self.label_cursor + 1) % (config.source.services.len() + 1);
-            push(&mut fibs[2], &mut lengths[2], &fig0_9(config, clock)?)?;
+            push(&mut fibs[2], &mut lengths[2], &fig0_9(config, clock))?;
         }
 
         let mut output = Vec::with_capacity(fib_count * 32);
@@ -167,22 +186,16 @@ impl FicCarousel {
             let (entries, cursor, limit, extension): (Vec<Vec<u8>>, &mut usize, usize, u8) =
                 match stage {
                     0 => {
+                        // One entry per subchannel; validation rejects conflicts.
+                        let mut signalled = HashSet::new();
                         let entries = config
-                            .source
                             .components
                             .iter()
                             .filter_map(|component| {
-                                let service = config
-                                    .source
-                                    .services
-                                    .iter()
-                                    .find(|service| service.uid == component.service)?;
-                                let sub = config
-                                    .source
-                                    .subchannels
-                                    .iter()
-                                    .find(|sub| sub.uid == component.subchannel)?;
-                                (service.language != 0).then_some(vec![sub.id, service.language])
+                                let language = config.source.services[component.service].language;
+                                (language != 0 && signalled.insert(component.subchannel)).then(
+                                    || vec![config.subchannels[component.subchannel].id, language],
+                                )
                             })
                             .collect();
                         (entries, &mut self.language_cursor, 7, 5)
@@ -202,26 +215,25 @@ impl FicCarousel {
                     }
                     _ => {
                         let entries = config
-                            .source
                             .components
                             .iter()
-                            .filter(|component| !component.user_applications.is_empty())
-                            .map(|component| {
-                                let service = config
-                                    .source
-                                    .services
-                                    .iter()
-                                    .find(|service| service.uid == component.service)
-                                    .expect("validated service");
-                                let scids = config
-                                    .source
-                                    .components
-                                    .iter()
-                                    .filter(|other| other.service == component.service)
-                                    .position(|other| other.uid == component.uid)
-                                    .expect("validated component");
+                            .zip(&config.source.components)
+                            .filter(|(_, raw)| !raw.user_applications.is_empty())
+                            .map(|(component, _)| {
+                                let service = &config.source.services[component.service];
                                 let [high, low] = (service.id as u16).to_be_bytes();
-                                vec![high, low, (scids as u8) << 4 | 1, 0, 0x42, 12, 60]
+                                // One application, type in 11 bits, 2 bytes of X-PAD data.
+                                let [ua_high, ua_low] =
+                                    (USER_APPLICATION_SLIDESHOW << 5 | 2).to_be_bytes();
+                                vec![
+                                    high,
+                                    low,
+                                    component.scids << 4 | 1,
+                                    ua_high,
+                                    ua_low,
+                                    XPAD_APPTY_MOT_START,
+                                    DSCTY_MOT,
+                                ]
                             })
                             .collect();
                         (entries, &mut self.application_cursor, 2, 13)
@@ -255,9 +267,21 @@ fn fig0_0(eid: u16, count: u64) -> [u8; 6] {
     [5, 0, e0, e1, high, low]
 }
 
-fn fig0_9(config: &ValidatedConfig, clock: FrameClock) -> Result<[u8; 5]> {
+fn fig0_9(config: &ValidatedConfig, clock: FrameClock) -> [u8; 5] {
+    static LOOKUP_FAILED: AtomicBool = AtomicBool::new(false);
     let lto = if config.source.ensemble.local_time_offset_auto {
-        crate::timing::local_offset_half_hours(clock.unix_seconds)?
+        match crate::timing::local_offset_half_hours(clock.unix_seconds) {
+            Ok(lto) => {
+                LOOKUP_FAILED.store(false, Ordering::Relaxed);
+                lto
+            }
+            Err(err) => {
+                if !LOOKUP_FAILED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(%err, "local time offset lookup failed; signalling UTC");
+                }
+                0
+            }
+        }
     } else {
         config.source.ensemble.local_time_offset_half_hours
     };
@@ -266,13 +290,13 @@ fn fig0_9(config: &ValidatedConfig, clock: FrameClock) -> Result<[u8; 5]> {
     } else {
         lto as u8
     };
-    Ok([
+    [
         4,
         9,
         lto_field,
         config.source.ensemble.ecc,
         config.source.ensemble.international_table,
-    ])
+    ]
 }
 
 fn fig0_7(counter: u16, service_count: u8) -> [u8; 4] {
@@ -397,6 +421,59 @@ mod tests {
     }
 
     #[test]
+    fn ensemble_information_opens_each_transmission_frame_only() {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        config.ensemble.reconfiguration_counter = Some(0x123);
+        let valid = config.clone().validate().unwrap();
+        let mut carousel = FicCarousel::new().with_reconfiguration_counter(Some(0x124));
+        let first = carousel
+            .write(&valid, FrameClock::new(8, 0, 0).unwrap())
+            .unwrap();
+        assert_eq!(&first[..10], &[5, 0, 0x4f, 0xff, 0, 8, 3, 7, 5, 0x24]);
+        let second = carousel
+            .write(&valid, FrameClock::new(9, 0, 0).unwrap())
+            .unwrap();
+        assert_eq!(&second[..2], &[5, 1], "FIB 0 starts with FIG 0/1");
+
+        // Mode IV has 48 ms transmission frames; modes II and III 24 ms.
+        for (mode, count, expected) in [(4, 2, true), (4, 3, false), (2, 1, true), (3, 1, true)] {
+            config.ensemble.mode = mode;
+            let valid = config.clone().validate().unwrap();
+            let fic = FicCarousel::new()
+                .write(&valid, FrameClock::new(count, 0, 0).unwrap())
+                .unwrap();
+            assert_eq!(fic[1] == 0, expected, "mode {mode} frame {count}");
+        }
+    }
+
+    #[test]
+    fn shared_subchannel_language_is_signalled_once() {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        config.services[0].language = 8;
+        config.services.push(crate::config::ServiceConfig {
+            uid: "radio_two".into(),
+            id: 0x4da5,
+            label: "Radio Two".into(),
+            short_label: None,
+            pty: 0,
+            language: 8,
+        });
+        config.components.push(crate::config::ComponentConfig {
+            uid: "component_two".into(),
+            service: "radio_two".into(),
+            subchannel: "audio_one".into(),
+            user_applications: Vec::new(),
+        });
+        let valid = config.validate().unwrap();
+        let fibs = FicCarousel::new()
+            .write(&valid, FrameClock::new(0, 0, 0).unwrap())
+            .unwrap();
+        assert_eq!(&fibs[64 + 13..64 + 17], &[3, 5, 1, 8]);
+    }
+
+    #[test]
     fn explicit_short_label_mask_is_emitted_in_fig_one() {
         let mut config: Config =
             serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
@@ -484,6 +561,7 @@ mod tests {
                     buffer_frames: 40,
                     prebuffer_frames: 4,
                     timing: crate::config::InputTiming::Prebuffering,
+                    backpressure: None,
                 },
             });
             config.components.push(ComponentConfig {
@@ -580,6 +658,7 @@ mod oracle_tests {
                     buffer_frames: 40,
                     prebuffer_frames: 4,
                     timing: InputTiming::Prebuffering,
+                    backpressure: None,
                 },
             });
             config.components.push(ComponentConfig {
@@ -609,10 +688,14 @@ mod oracle_tests {
                 .write(&valid, FrameClock::new(count, 0, 0).unwrap())
                 .unwrap();
             let figs = decode(&fic);
-            assert!(
-                figs.iter()
-                    .any(|fig| matches!(fig, Fig::F0_0(f) if f.eid == source.ensemble.id)),
-                "FIG 0/0 missing in frame {count}"
+            // Mode I: FIG 0/0 once per 96 ms transmission frame, first in FIB 0.
+            let fig0_0 = figs
+                .iter()
+                .position(|fig| matches!(fig, Fig::F0_0(f) if f.eid == source.ensemble.id));
+            assert_eq!(
+                fig0_0,
+                count.is_multiple_of(4).then_some(0),
+                "FIG 0/0 placement in frame {count}"
             );
             for fig in figs {
                 match fig {

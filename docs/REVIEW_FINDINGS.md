@@ -9,19 +9,40 @@ Severity: **High** = wrong on-air data or loss of service, **Medium** = incorrec
 | # | Severity | Area | Finding |
 |---|----------|------|---------|
 | 1 | High | FIG 0/10 | **Fixed.** Seconds and millisecond MSBs were swapped in the long-form UTC byte |
-| 2 | High | TCP EDI input | A half-open producer connection can block the subchannel indefinitely |
+| 2 | High | TCP EDI input | **Fixed.** A half-open producer connection can block the subchannel indefinitely |
 | 3 | Medium | Labels | **Fixed.** ASCII was sent unconverted as EBU Latin. `$ \ ^ \` { \| } ~` display as other glyphs, and umlauts are rejected |
-| 4 | Medium | TCP EDI input | Backpressure pushes clock drift back to the encoder, so nothing bounds latency or absorbs drift |
-| 5 | Medium | Reconfiguration | The FIG 0/7 counter is not incremented on structural changes, and the change is not aligned to a CIF-count boundary |
-| 6 | Low | FIC | FIG 0/0 (and FIG 0/7) are sent in every CIF; C++ sends them only at frame phase 0 |
-| 7 | Low | FIG 0/13 | Secondary components get SCIdS > 0 without FIG 0/8 |
-| 8 | Low | FIG 0/5 | Shared subchannels produce duplicate or conflicting language entries |
-| 9 | Low | Hot reload | Restarts sever encoder and receiver TCP sessions more often than needed |
-| 10 | Low | Hot reload | Moving a port from an input to a TCP output fails with EADDRINUSE |
-| 11 | Low | Robustness | Any `?` error in the frame loop stops the whole mux |
-| 12 | Low | Timing | Local time offset truncates 45-minute zones. The clock is never re-synced to UTC |
-| 13 | Low | Buffering | Effective input buffering is about 2 × `buffer_frames` |
-| 14 | Low | Cleanup | URI parsing is duplicated between `config.rs` and `runtime.rs` |
+| 4 | Medium | TCP EDI input | **Fixed.** Backpressure pushes clock drift back to the encoder, so nothing bounds latency or absorbs drift |
+| 5 | Medium | Reconfiguration | **Fixed.** The FIG 0/7 counter is not incremented on structural changes, and the change is not aligned to a CIF-count boundary |
+| 6 | Low | FIC | **Fixed.** FIG 0/0 (and FIG 0/7) are sent in every CIF; C++ sends them only at frame phase 0 |
+| 7 | Low | FIG 0/13 | **Fixed.** Secondary components get SCIdS > 0 without FIG 0/8 |
+| 8 | Low | FIG 0/5 | **Fixed.** Shared subchannels produce duplicate or conflicting language entries |
+| 9 | Low | Hot reload | **Fixed.** Restarts sever encoder and receiver TCP sessions more often than needed |
+| 10 | Low | Hot reload | **Mitigated.** Moving a port from an input to a TCP output fails with EADDRINUSE |
+| 11 | Low | Robustness | **Fixed.** Any `?` error in the frame loop stops the whole mux |
+| 12 | Low | Timing | **Fixed.** Local time offset truncates 45-minute zones. The clock is never re-synced to UTC |
+| 13 | Low | Buffering | **Fixed.** Effective input buffering is about 2 × `buffer_frames` |
+| 14 | Low | Cleanup | **Fixed.** URI parsing is duplicated between `config.rs` and `runtime.rs` |
+
+## Resolution status (2026-09-30)
+
+All 14 findings are resolved; finding 10 is mitigated and documented. See README "Operating notes" for the resulting behaviour.
+
+| # | Resolution |
+|---|------------|
+| 1 | Fixed: seconds and millisecond MSBs in their EN 300 401 positions; covered by the FIG 0/10 oracle test. |
+| 2 | Fixed: newest producer replaces the previous connection; 10 s idle timeout. |
+| 3 | Fixed: labels encoded as EBU Latin (`dabmux::charset`). |
+| 4 | Fixed: backpressure is configurable per TCP input. It stays the default, because unpaced file encoders need it: making it opt-in broke `odr-audioenc -i test.wav` with continuous drops and AU errors. `backpressure: false` drops oldest for live encoders, and sustained drops are logged with a hint. |
+| 5 | Fixed: FIG 0/7 counter advances on structural change; activation waits for a transmission-frame boundary. |
+| 6 | Fixed: FIG 0/0 and 0/7 once per transmission frame (mode I 96 ms, IV 48 ms, II/III 24 ms). |
+| 7 | Fixed: validation allows user applications only on a service's first component. |
+| 8 | Fixed: one FIG 0/5 entry per subchannel; conflicting languages rejected. |
+| 9 | Fixed: inputs reused unless input settings or bitrate change; TCP output settings applied in place. |
+| 10 | Mitigated: bind error explains the port is still held; documented in README. |
+| 11 | Fixed: failed frames are skipped and counted (`frame_errors`); activation errors are returned to the caller; FIG 0/9 falls back to UTC. |
+| 12 | Fixed: `clock_drift_ms` stat and warning; LTO truncation and missed-tick behaviour documented. |
+| 13 | Fixed: channel capacity 1 with backpressure, so depth is `buffer_frames` + 1; documented. |
+| 14 | Fixed: `InputConfig::endpoint()` parses URIs once; components resolved to indices in `ValidatedConfig`. |
 
 ## Details
 

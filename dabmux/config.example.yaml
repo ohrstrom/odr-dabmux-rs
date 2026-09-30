@@ -21,6 +21,10 @@ subchannels:
     input:
       protocol: edi
       uri: tcp://127.0.0.1:9000
+      # TCP inputs throttle the encoder by default (backpressure), which an
+      # unpaced file encoder (odr-audioenc -i file.wav) needs. For a live
+      # encoder, `backpressure: false` drops frames instead, absorbing drift.
+      # backpressure: false
 
 components:
   - uid: component_one
