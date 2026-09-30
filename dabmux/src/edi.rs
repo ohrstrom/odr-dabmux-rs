@@ -276,7 +276,7 @@ pub fn decode_sti_payload(packet: &AfPacket, stream_index: u16) -> Result<TimedP
         .iter()
         .find(|tag| tag.name == name)
         .context("missing requested STI stream")?;
-    if tag.value.len() < 4 {
+    if tag.value.len() < 3 {
         bail!("short STI stream tag");
     }
     Ok(TimedPayload {
@@ -285,7 +285,7 @@ pub fn decode_sti_payload(packet: &AfPacket, stream_index: u16) -> Result<TimedP
         seconds,
         tsta,
         stream_index,
-        bytes: tag.value[4..].to_vec(),
+        bytes: tag.value[3..].to_vec(),
     })
 }
 
@@ -433,7 +433,7 @@ mod tests {
                 },
                 Tag {
                     name: [b's', b's', 0, 1],
-                    value: vec![0, 0, 0, 0, 1, 2, 3],
+                    value: vec![0, 0, 0, 1, 2, 3],
                 },
             ],
         };
@@ -475,6 +475,28 @@ mod tests {
         bytes.extend_from_slice(&payload);
         bytes.extend_from_slice(&crc16(&bytes).to_be_bytes());
         assert_eq!(AfPacket::decode(&bytes).unwrap(), packet);
+    }
+
+    #[test]
+    fn sti_stream_tag_contains_three_header_bytes_and_full_audio_frame() {
+        let audio = vec![0x5a; 216];
+        let mut stream = vec![0, 0, 0];
+        stream.extend_from_slice(&audio);
+        let packet = AfPacket {
+            sequence: 1,
+            tags: vec![
+                pointer_tag(*b"DSTI"),
+                Tag {
+                    name: *b"dsti",
+                    value: vec![0, 1],
+                },
+                Tag {
+                    name: [b's', b's', 0, 1],
+                    value: stream,
+                },
+            ],
+        };
+        assert_eq!(decode_sti_payload(&packet, 1).unwrap().bytes, audio);
     }
 
     #[test]
