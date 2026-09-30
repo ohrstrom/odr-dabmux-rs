@@ -74,6 +74,7 @@ struct BufferedInput {
     prebuffer_frames: usize,
     prebuffering: bool,
     timing: InputTiming,
+    backpressure: bool,
 }
 
 impl BufferedInput {
@@ -94,11 +95,15 @@ impl BufferedInput {
             prebuffer_frames,
             prebuffering: true,
             timing,
+            backpressure: matches!(input, InputConfig::Edi { uri, .. } if uri.starts_with("tcp://")),
         }
     }
 
     fn take(&mut self, clock: FrameClock, stats: &RuntimeStats) -> Option<Vec<u8>> {
-        while let Ok(payload) = self.rx.try_recv() {
+        while !self.backpressure || self.queue.len() < self.max_frames {
+            let Ok(payload) = self.rx.try_recv() else {
+                break;
+            };
             if self.timing == InputTiming::Timestamped {
                 let Some(timestamp) = payload_time_ms(&payload) else {
                     stats.invalid_timestamps.fetch_add(1, Ordering::Relaxed);
@@ -235,8 +240,8 @@ async fn receive_input_tcp(
                 }
                 match AfPacket::decode(&packet).and_then(|p| decode_sti_payload(&p, stream_index)) {
                     Ok(payload) => {
-                        if tx.try_send(payload).is_err() {
-                            stats.input_drops.fetch_add(1, Ordering::Relaxed);
+                        if tx.send(payload).await.is_err() {
+                            break;
                         }
                     }
                     Err(err) => {
@@ -844,6 +849,7 @@ mod tests {
             prebuffer_frames: 2,
             prebuffering: true,
             timing: InputTiming::Prebuffering,
+            backpressure: false,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 0, 0).unwrap();
@@ -858,6 +864,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_prebuffering_preserves_frames_when_encoder_runs_ahead() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut input = BufferedInput {
+            rx,
+            queue: VecDeque::new(),
+            max_frames: 2,
+            prebuffer_frames: 1,
+            prebuffering: true,
+            timing: InputTiming::Prebuffering,
+            backpressure: true,
+        };
+        let stats = RuntimeStats::default();
+        let clock = FrameClock::new(0, 0, 0).unwrap();
+        for n in 1..=5 {
+            tx.send(payload(vec![n], None, None)).await.unwrap();
+        }
+        for n in 1..=5 {
+            assert_eq!(input.take(clock, &stats), Some(vec![n]));
+        }
+        assert_eq!(stats.input_drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn timestamped_input_discards_late_and_keeps_future() {
         let (tx, rx) = mpsc::channel(8);
         let mut input = BufferedInput {
@@ -867,6 +896,7 @@ mod tests {
             prebuffer_frames: 1,
             prebuffering: false,
             timing: InputTiming::Timestamped,
+            backpressure: false,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 946_684_800, 48).unwrap();
@@ -893,6 +923,7 @@ mod tests {
             prebuffer_frames: 1,
             prebuffering: false,
             timing: InputTiming::Timestamped,
+            backpressure: false,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 946_684_800, 48).unwrap();
