@@ -1,6 +1,6 @@
 # Rust implementation review findings
 
-Review date: 2026-09-30. Scope: all of `dabmux/src/` (about 3.8k lines), checked against the C++ reference in `__ref/ODR-DabMux/` and against EN 300 401, TS 102 693 and TS 101 756 from memory. The PDFs are not in the repository, so spec references are to clause content, not page numbers. `cargo test` passes (32 tests) with this code as reviewed.
+Review date: 2026-09-30. Scope: all of `dabmux/src/` (about 3.8k lines), checked against the C++ reference in `__ref/ODR-DabMux/` and against EN 300 401, TS 102 693 and TS 101 756 from memory. The PDFs are not in the repository, so spec references are to clause content, not page numbers. `cargo test` passed 32 tests on the code as reviewed; after the fixes it passes 49.
 
 Severity: **High** = wrong on-air data or loss of service, **Medium** = incorrect in realistic use, **Low** = deviation, robustness or cleanup.
 
@@ -11,7 +11,7 @@ Severity: **High** = wrong on-air data or loss of service, **Medium** = incorrec
 | 1 | High | FIG 0/10 | **Fixed.** Seconds and millisecond MSBs were swapped in the long-form UTC byte |
 | 2 | High | TCP EDI input | **Fixed.** A half-open producer connection can block the subchannel indefinitely |
 | 3 | Medium | Labels | **Fixed.** ASCII was sent unconverted as EBU Latin. `$ \ ^ \` { \| } ~` display as other glyphs, and umlauts are rejected |
-| 4 | Medium | TCP EDI input | **Fixed.** Backpressure pushes clock drift back to the encoder, so nothing bounds latency or absorbs drift |
+| 4 | Medium | TCP EDI input | **Fixed.** Backpressure pushed clock drift back to the encoder, with no option to absorb it at the mux |
 | 5 | Medium | Reconfiguration | **Fixed.** The FIG 0/7 counter is not incremented on structural changes, and the change is not aligned to a CIF-count boundary |
 | 6 | Low | FIC | **Fixed.** FIG 0/0 (and FIG 0/7) are sent in every CIF; C++ sends them only at frame phase 0 |
 | 7 | Low | FIG 0/13 | **Fixed.** Secondary components get SCIdS > 0 without FIG 0/8 |
@@ -19,7 +19,7 @@ Severity: **High** = wrong on-air data or loss of service, **Medium** = incorrec
 | 9 | Low | Hot reload | **Fixed.** Restarts sever encoder and receiver TCP sessions more often than needed |
 | 10 | Low | Hot reload | **Mitigated.** Moving a port from an input to a TCP output fails with EADDRINUSE |
 | 11 | Low | Robustness | **Fixed.** Any `?` error in the frame loop stops the whole mux |
-| 12 | Low | Timing | **Fixed.** Local time offset truncates 45-minute zones. The clock is never re-synced to UTC |
+| 12 | Low | Timing | **Fixed/documented.** Local time offset truncates 45-minute zones. The clock is never re-synced to UTC |
 | 13 | Low | Buffering | **Fixed.** Effective input buffering is about 2 × `buffer_frames` |
 | 14 | Low | Cleanup | **Fixed.** URI parsing is duplicated between `config.rs` and `runtime.rs` |
 
@@ -64,7 +64,7 @@ Fix: `(((second & 0x3f) << 2) | ((millis >> 8) & 3)) as u8`. Add a test with non
 
 The edinburgh receiver's decoder (`__ref/edinburgh/shared/src/dab/fic.rs`, `Fig0_10::from_bytes`) reads `second = data[4] >> 2`. This independently confirms the correct layout, and a round-trip test through that decoder would have caught the bug (see R2 below).
 
-### 2. TCP EDI input: a stale connection locks out reconnects (High)
+### 2. TCP EDI input: a stale connection locks out reconnects (High) — fixed
 
 [runtime.rs:222-296](../dabmux/src/runtime.rs#L222-L296): the first connection that delivers a valid frame becomes `active_client`. Any other connection is closed on its first frame ("ignoring additional TCP EDI producer"). The ownership is released only when the owner's `read_exact` fails. There is no read timeout and no TCP keepalive. If the encoder host reboots or the network path drops without a FIN or RST, the old socket stays half-open and blocks forever. The reconnecting encoder is then rejected indefinitely, and the subchannel outputs silence until the mux restarts or its config changes.
 
@@ -85,7 +85,9 @@ UTF-8 input such as `ä ö ü ß` is rejected, although EBU Latin can encode it 
 
 Candidate: invert the edinburgh `EBU_LATIN_TO_UNICODE` table (see R1 below) to get a UTF-8 → EBU Latin encoder. Validate the length after conversion (16 bytes), and compute the short-label mask on the converted bytes.
 
-### 4. TCP input backpressure versus clock drift (Medium)
+### 4. TCP input backpressure versus clock drift (Medium) — fixed
+
+**Status:** backpressure is now a per-input setting (`backpressure: false` drops oldest). The recommendation below to make it opt-in was tried and reverted: with drop-oldest as the default, the unpaced `odr-audioenc -i test.wav` workflow dropped 729 frames in about 8 s and DABlin reported AU errors. Backpressure therefore stays the TCP default. Sustained overflow is logged per subchannel with a hint, and the buffered depth with backpressure is `buffer_frames` + 1.
 
 For TCP inputs, `backpressure: true` ([runtime.rs:101](../dabmux/src/runtime.rs#L101), [:106](../dabmux/src/runtime.rs#L106)) stops draining the channel once `queue.len() == max_frames`, and the receiver task then blocks on `tx.send().await`. With prebuffering, frames are therefore never dropped. An encoder whose capture clock runs slightly fast accumulates latency until the channel, queue and TCP socket buffers are full. After that, the encoder blocks on send, which typically causes an ALSA overrun or dropped audio in ODR-AudioEnc.
 
@@ -93,47 +95,47 @@ C++ prebuffering drops frames when the buffer exceeds its maximum. This keeps la
 
 Candidate: make backpressure opt-in (e.g. `input.backpressure: true` for file sources). By default, drop the oldest frames when the queue exceeds `buffer_frames`, as UDP inputs already do.
 
-### 5. Reconfiguration signalling (Medium)
+### 5. Reconfiguration signalling (Medium) — fixed
 
 - When `reconfiguration_counter` is configured, FIG 0/7 carries it verbatim ([fic.rs:46-52](../dabmux/src/fic.rs#L46-L52)). A structural change detected at [runtime.rs:753-767](../dabmux/src/runtime.rs#L753-L767) does not increment it, so a receiver that relies on FIG 0/7 sees no change. EN 300 401 requires the count to change with each reconfiguration. Candidate: auto-increment modulo 1024 when `structure_changed`, unless the new config explicitly changes the counter.
 - The switch happens on whichever frame follows preparation. EN 300 401 §6.5 reconfigures at a signalled CIF count, and in mode I that is at a transmission-frame boundary (CIF count mod 4 == 0). Aligning the switch to `clock.count % 4 == 0` is cheap and a step towards the full advance signalling already listed in the README. The full signalling uses the FIG 0/0 change flags, the next-configuration FIG 0/1 and 0/2, and the occurrence change.
 
-### 6. FIG 0/0 cadence (Low)
+### 6. FIG 0/0 cadence (Low) — fixed
 
 [fic.rs:41-52](../dabmux/src/fic.rs#L41-L52) writes FIG 0/0 (and FIG 0/7) into FIB 0 of every CIF. C++ sends them only when `framephase == 0` (`src/fig/FIGCarousel.cpp:300-440`), i.e. once per 96 ms mode I transmission frame, as the first FIG of the frame. Receivers tolerate the higher rate, but it costs 6–10 bytes per CIF. Some decoders use FIG 0/0 at phase 0 as a transmission-frame marker. Candidate: emit it only on `clock.count % 4 == 0` for modes I, II and IV. Check the mode III rule before changing that mode.
 
-### 7. FIG 0/13 SCIdS without FIG 0/8 (Low)
+### 7. FIG 0/13 SCIdS without FIG 0/8 (Low) — fixed
 
 [fic.rs:216-224](../dabmux/src/fic.rs#L216-L224) derives SCIdS from the component's position within its service. For the primary component this is 0, which is correct. A slideshow on a secondary component would get SCIdS ≥ 1, but no FIG 0/8 maps SCIdS to a subchannel, so receivers cannot resolve it. Candidate: either restrict user applications to the primary component in validation, or emit FIG 0/8.
 
-### 8. FIG 0/5 with shared subchannels (Low)
+### 8. FIG 0/5 with shared subchannels (Low) — fixed
 
 Language entries are built per component and keyed by SubChId ([fic.rs:170-187](../dabmux/src/fic.rs#L170-L187)). Validation allows two services to share one subchannel (the tests do this). The mux then emits duplicate entries, or conflicting ones if the two services have different languages. Candidate: deduplicate by SubChId, or reject conflicting languages.
 
-### 9. Hot reload restarts more sessions than necessary (Low)
+### 9. Hot reload restarts more sessions than necessary (Low) — fixed
 
 - [runtime.rs:612-627](../dabmux/src/runtime.rs#L612-L627): an input handle is kept only if its whole `SubchannelConfig` is unchanged. Changing the protection level, subchannel ID or uid aborts the receiver task. That drops the encoder's TCP connection and the buffered frames, and forces prebuffering again. Only a changed input or bitrate actually requires this.
 - [runtime.rs:641-667](../dabmux/src/runtime.rs#L641-L667): changing `max_frames_queued` or `preroll_ms` on a TCP output aborts the server task. The `JoinSet` of client tasks is dropped with it, so every connected modulator is disconnected.
 
-### 10. Port moved from input to output (Low)
+### 10. Port moved from input to output (Low) — mitigated
 
 `prepare_resources` binds new listeners while the old ones are still open. A candidate that frees port N from an input and reuses it as a TCP output (or the other way round) fails with EADDRINUSE and is rejected. This is safe, but it is surprising. Document the behaviour or handle this case.
 
-### 11. Any `?` error stops the mux (Low)
+### 11. Any `?` error stops the mux (Low) — fixed
 
 Every `?` inside the frame loop in `runtime::run` ([runtime.rs:770-918](../dabmux/src/runtime.rs#L770-L918)) ends the runtime, and `try_join!` then stops the process. Examples are the carousel, `local_offset_half_hours`, `assemble`, and the seconds conversion. Most of these cannot fail with a validated config. Two can: a timezone lookup failure, and TAI arithmetic after an unexpected bulletin value. Candidate: log the error, keep the last good FIC or frame, count the failure in stats, and continue.
 
-### 12. Timing details (Low)
+### 12. Timing details (Low) — fixed
 
 - `local_offset_half_hours` ([timing.rs:96-103](../dabmux/src/timing.rs#L96-L103)) truncates, so Nepal (+5:45) becomes +5:30. FIG 0/9 can only express half hours anyway, so this only needs documenting.
 - The frame clock is derived from wall time once at startup and afterwards advanced only by `tick()`. It follows the tokio monotonic clock and ignores NTP steps. C++ behaves the same way. For SFN use, consider comparing it against `SystemTime` periodically and warning (or rephasing) when the difference exceeds a threshold.
 - After a stall, `MissedTickBehavior::Skip` plus explicit `clock.tick()` calls skip frames: DLFC jumps and TIST stays on schedule. This is a reasonable choice, but it differs from C++ (which bursts) and should be documented.
 
-### 13. Buffering depth (Low)
+### 13. Buffering depth (Low) — fixed
 
 The mpsc channel has capacity `buffer_frames`, and `BufferedInput.queue` holds up to `buffer_frames` more ([runtime.rs:538](../dabmux/src/runtime.rs#L538)). For UDP inputs the effective worst-case depth is therefore about twice the configured value. Candidate: use a small channel capacity, or document the combined depth.
 
-### 14. Cleanup (Low)
+### 14. Cleanup (Low) — fixed
 
 - URI to socket-address parsing is implemented twice: [config.rs:377-410](../dabmux/src/config.rs#L377-L410) and `bind_address`/`input_key` in [runtime.rs:192-209](../dabmux/src/runtime.rs#L192-L209), [:461-468](../dabmux/src/runtime.rs#L461-L468). Resolve it once during validation, e.g. store `SocketAddr` and transport in `ValidatedSubchannel`.
 - `fic.rs` repeatedly looks up services and subchannels by uid with linear searches on every frame. Precompute the lookups in `ValidatedConfig`.

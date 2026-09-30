@@ -1,4 +1,4 @@
-//! Initial classic FIC carousel for programme audio ensembles.
+//! Classic FIC carousel for programme audio ensembles.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};

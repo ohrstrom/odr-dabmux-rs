@@ -1,5 +1,7 @@
 # Adapted from the supplied ODR-DabMux production INFO configuration.
 # Automatic local offset uses the host timezone; bulletin URLs require HTTPS access.
+# TCP inputs throttle their encoder by default (backpressure). For live encoders
+# whose clock drift should be absorbed here, add `backpressure: false` per input.
 ensemble:
   id: 1
   ecc: 225

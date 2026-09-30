@@ -1,6 +1,6 @@
 # ODR-DabMux C++ reference research
 
-The bundled C++ source at `__ref/ODR-DabMux/` is the behavioral reference for the Rust port. The compiled binary `__ref/ODR-DabMux/odr-dabmux --version` reports `v5.5.1-dirty` (checked 2026-09-30). The Rust implementation remains separate. `__ref/sonicecast/` is a Rust hot-reload example; `docs/etsi/README.md` indexes standards. Source paths below are relative to `__ref/ODR-DabMux/`.
+The bundled C++ source at `__ref/ODR-DabMux/` is the behavioral reference for the Rust port. The compiled binary `__ref/ODR-DabMux/odr-dabmux --version` reports `v5.5.1-dirty` (checked 2026-09-30). The Rust implementation remains separate. `__ref/sonicecast/` is a Rust hot-reload example. `__ref/edinburgh/` is a Rust EDI receiver/player (GPL-2.0); its EBU Latin table and FIC decoder are reused (see [REVIEW_FINDINGS.md](REVIEW_FINDINGS.md), R1/R2). `docs/etsi/README.md` indexes standards. `__ref/` is not tracked in git. Source paths below are relative to `__ref/ODR-DabMux/`.
 
 ## Architecture and control flow
 
