@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::config::{SubchannelKind, ValidatedConfig};
+use crate::config::{short_label_mask, SubchannelKind, ValidatedConfig};
 use dabmux::frame::FrameClock;
 
 pub struct FicCarousel {
@@ -117,10 +117,20 @@ impl FicCarousel {
             push(&mut fibs[2], &mut lengths[2], &fig0_10(clock))?;
         } else {
             let label_fig = if self.label_cursor == 0 {
-                fig1_label(0, config.source.ensemble.id, &config.source.ensemble.label)
+                fig1_label(
+                    0,
+                    config.source.ensemble.id,
+                    &config.source.ensemble.label,
+                    config.source.ensemble.short_label.as_deref(),
+                )
             } else {
                 let service = &config.source.services[self.label_cursor - 1];
-                fig1_label(1, service.id as u16, &service.label)
+                fig1_label(
+                    1,
+                    service.id as u16,
+                    &service.label,
+                    service.short_label.as_deref(),
+                )
             };
             push(&mut fibs[2], &mut lengths[2], &label_fig)?;
             self.label_cursor = (self.label_cursor + 1) % (config.source.services.len() + 1);
@@ -191,15 +201,15 @@ fn fig0_10(clock: FrameClock) -> [u8; 8] {
     ]
 }
 
-fn fig1_label(extension: u8, id: u16, label: &str) -> [u8; 22] {
+fn fig1_label(extension: u8, id: u16, label: &str, short_label: Option<&str>) -> [u8; 22] {
     let mut fig = [0u8; 22];
     fig[0] = (1 << 5) | 21;
     fig[1] = extension;
     fig[2..4].copy_from_slice(&id.to_be_bytes());
     fig[4..20].fill(b' ');
     fig[4..4 + label.len()].copy_from_slice(label.as_bytes());
-    // With no explicit short label, use the first eight characters.
-    fig[20..22].copy_from_slice(&0xff00u16.to_be_bytes());
+    let mask = short_label_mask("short_label", label, short_label).expect("validated short label");
+    fig[20..22].copy_from_slice(&mask.to_be_bytes());
     fig
 }
 
@@ -244,6 +254,7 @@ mod tests {
             uid: "radio_two".into(),
             id: 0x4da5,
             label: "Radio Two".into(),
+            short_label: None,
         });
         config.components.push(crate::config::ComponentConfig {
             uid: "component_two".into(),
@@ -277,5 +288,25 @@ mod tests {
             .unwrap();
         assert_eq!(&fibs[6..10], &[3, 7, 5, 0x23]);
         assert_eq!(&fibs[10..16], &[5, 1, 4, 0, 0x88, 0x48]);
+    }
+
+    #[test]
+    fn explicit_short_label_mask_is_emitted_in_fig_one() {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        config.ensemble.label = "RND D00 - XX".into();
+        config.ensemble.short_label = Some("RND D00".into());
+        config.services[0].label = "105 DJ HRND-001".into();
+        config.services[0].short_label = Some("HRND-001".into());
+        let valid = config.validate().unwrap();
+        let mut carousel = FicCarousel::new();
+        let first = carousel
+            .write(&valid, FrameClock::new(1, 0, 0).unwrap())
+            .unwrap();
+        assert_eq!(&first[64 + 20..64 + 22], &0xfe00u16.to_be_bytes());
+        let second = carousel
+            .write(&valid, FrameClock::new(2, 0, 24).unwrap())
+            .unwrap();
+        assert_eq!(&second[64 + 20..64 + 22], &0x01feu16.to_be_bytes());
     }
 }

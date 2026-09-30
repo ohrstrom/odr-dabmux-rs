@@ -87,6 +87,7 @@ pub struct EnsembleConfig {
     pub id: u16,
     pub ecc: u8,
     pub label: String,
+    pub short_label: Option<String>,
     #[serde(default)]
     pub local_time_offset_half_hours: i8,
     #[serde(default)]
@@ -109,6 +110,7 @@ pub struct ServiceConfig {
     pub uid: String,
     pub id: u32,
     pub label: String,
+    pub short_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -231,6 +233,11 @@ impl Config {
             bail!("ensemble.tist requires tai_utc_offset >= 32");
         }
         validate_label("ensemble.label", &self.ensemble.label)?;
+        short_label_mask(
+            "ensemble.short_label",
+            &self.ensemble.label,
+            self.ensemble.short_label.as_deref(),
+        )?;
         if self.services.is_empty() {
             bail!("at least one service is required");
         }
@@ -249,6 +256,11 @@ impl Config {
         for service in &self.services {
             validate_uid("service", &service.uid)?;
             validate_label("service.label", &service.label)?;
+            short_label_mask(
+                "service.short_label",
+                &service.label,
+                service.short_label.as_deref(),
+            )?;
             if service.id > u16::MAX as u32 {
                 bail!(
                     "service {} id exceeds 16-bit programme service range",
@@ -491,6 +503,31 @@ fn validate_label(path: &str, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn short_label_mask(path: &str, label: &str, short_label: Option<&str>) -> anyhow::Result<u16> {
+    if label.len() > 16 {
+        bail!("{path} full label exceeds 16 characters");
+    }
+    let Some(short_label) = short_label else {
+        return Ok(0xff00);
+    };
+    if short_label.is_empty() || short_label.len() > 8 || !short_label.is_ascii() {
+        bail!("{path} must contain 1..=8 printable ASCII characters from the full label");
+    }
+    let mut remaining = short_label.bytes();
+    let mut wanted = remaining.next();
+    let mut mask = 0u16;
+    for (position, character) in label.bytes().enumerate() {
+        if Some(character) == wanted {
+            mask |= 0x8000 >> position;
+            wanted = remaining.next();
+            if wanted.is_none() {
+                return Ok(mask);
+            }
+        }
+    }
+    bail!("{path} must be a character subsequence of the full label")
+}
+
 pub fn load_from_file(path: &Path) -> anyhow::Result<ValidatedConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
@@ -618,6 +655,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("duplicate EDI TCP output port"));
+    }
+
+    #[test]
+    fn short_label_is_a_character_mask_not_a_second_text_field() {
+        assert_eq!(
+            short_label_mask("service.short_label", "105 DJ HRND-001", Some("HRND-001")).unwrap(),
+            0x01fe
+        );
+        assert_eq!(
+            short_label_mask("ensemble.short_label", "RND D00 - XX", Some("RND D00")).unwrap(),
+            0xfe00
+        );
+        assert_eq!(
+            short_label_mask("short_label", "Radio One", None).unwrap(),
+            0xff00
+        );
+        assert!(short_label_mask("short_label", "HELIUM RND-004", Some("HRND-004")).is_ok());
+        assert!(short_label_mask("short_label", "Radio One", Some("Other")).is_err());
+        assert!(short_label_mask("short_label", "Radio One", Some("Radio One")).is_err());
     }
 
     #[tokio::test]
