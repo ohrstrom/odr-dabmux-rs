@@ -6,6 +6,8 @@ mod api;
 mod config;
 mod fic;
 mod runtime;
+#[cfg(test)]
+mod testsupport;
 mod timing;
 
 use crate::app::App;

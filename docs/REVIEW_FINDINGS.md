@@ -8,9 +8,9 @@ Severity: **High** = wrong on-air data or loss of service, **Medium** = incorrec
 
 | # | Severity | Area | Finding |
 |---|----------|------|---------|
-| 1 | High | FIG 0/10 | Seconds and millisecond MSBs are swapped in the long-form UTC byte |
+| 1 | High | FIG 0/10 | **Fixed.** Seconds and millisecond MSBs were swapped in the long-form UTC byte |
 | 2 | High | TCP EDI input | A half-open producer connection can block the subchannel indefinitely |
-| 3 | Medium | Labels | ASCII is sent unconverted as EBU Latin. `$ \ ^ \` { \| } ~` display as other glyphs, and umlauts are rejected |
+| 3 | Medium | Labels | **Fixed.** ASCII was sent unconverted as EBU Latin. `$ \ ^ \` { \| } ~` display as other glyphs, and umlauts are rejected |
 | 4 | Medium | TCP EDI input | Backpressure pushes clock drift back to the encoder, so nothing bounds latency or absorbs drift |
 | 5 | Medium | Reconfiguration | The FIG 0/7 counter is not incremented on structural changes, and the change is not aligned to a CIF-count boundary |
 | 6 | Low | FIC | FIG 0/0 (and FIG 0/7) are sent in every CIF; C++ sends them only at frame phase 0 |
@@ -25,7 +25,9 @@ Severity: **High** = wrong on-air data or loss of service, **Medium** = incorrec
 
 ## Details
 
-### 1. FIG 0/10 long-form UTC field layout (High)
+### 1. FIG 0/10 long-form UTC field layout (High) — fixed
+
+**Status:** fixed in `fic.rs`. `oracle_tests::decoder_reads_fig0_10_date_and_time` covers it; before the fix it decoded 03:04:05.678 as 03:04:33.422.
 
 [fic.rs:301](../dabmux/src/fic.rs#L301):
 
@@ -52,7 +54,9 @@ Candidates:
 - Or let the newest producer take over, since an encoder reconnecting is the common case.
 - Enable `SO_KEEPALIVE` as an additional safeguard.
 
-### 3. Label character set (Medium)
+### 3. Label character set (Medium) — fixed
+
+**Status:** fixed. Labels and short labels are encoded with `dabmux::charset` (R1). Validation rejects characters outside the repertoire and measures length and the short-label mask on the encoded bytes.
 
 [config.rs:584-593](../dabmux/src/config.rs#L584-L593) accepts printable ASCII only, and [fic.rs:312](../dabmux/src/fic.rs#L312) copies the bytes verbatim into FIG 1 with charset 0 (EBU Latin, TS 101 756 Annex C). EBU Latin differs from ASCII at 0x24 `$`→`ł`, 0x5C `\`→`Ů`, 0x5E `^`→`Ł`, 0x60 `` ` ``→`Ą`, 0x7B `{`→`«`, 0x7C `|`→`ů`, 0x7D `}`→`»`, 0x7E `~`→`Ľ` (see `lib/charset/charset.cpp`). Labels using these characters display differently on receivers.
 
@@ -117,13 +121,17 @@ The mpsc channel has capacity `buffer_frames`, and `BufferedInput.queue` holds u
 
 `__ref/edinburgh` is a Rust EDI receiver and player. Its `shared` crate decodes the same structures the mux encodes. It is licensed GPLv2; its LICENSE file is the plain GPLv2 text, and the individual sources state neither "or later" nor "only". Before copying code into this project, confirm the licence terms with the edinburgh author (possibly the same people). They matter because this project is a port of ODR-DabMux, which is GPLv3-or-later. GPLv2-only code cannot be combined with it, while GPLv2-or-later code can.
 
-### R1. EBU Latin table (recommended, fixes finding 3)
+### R1. EBU Latin table (recommended, fixes finding 3) — done
+
+**Status:** implemented as `dabmux/src/charset.rs`.
 
 `shared/src/dab/tables.rs`: `EBU_LATIN_TO_UNICODE: [u16; 256]`. I compared it entry by entry against the C++ `utf8_encoded_EBU_Latin`, taking into account that the C++ table starts at index 1. **255 of 256 entries match.** The only difference is 0x1F, which TS 101 756 defines as a control code (preferred word break): edinburgh maps it to U+001F, C++ maps it to U+0082. Labels should never contain control codes, so for encoding this doesn't matter. The table has no duplicate code points, so it inverts cleanly into a `char → u8` encoder.
 
 Suggested use: a `charset` module with `encode_ebu_latin(&str) -> Result<Vec<u8>>` built from the inverted table. Reject 0x00–0x1F and 0x7F. Use it in `validate_label` / `short_label_mask` and `fig1_label`. Keep the decode direction too, for tests.
 
-### R2. FIC decoder as a test oracle (recommended)
+### R2. FIC decoder as a test oracle (recommended) — done
+
+**Status:** vendored under `dabmux/src/testsupport/edinburgh/` (test builds only; `__ref/` is gitignored, so a path dependency would break fresh clones). The tests are in `fic.rs` `oracle_tests`: a 12-service carousel run checks FIG 0/0, 0/1 (EEP-A and EEP-B), 0/2, 0/5, 0/9, 0/13 and FIG 1 labels with umlauts, and a separate test checks FIG 0/10. The tests verify FIB CRCs themselves.
 
 `shared/src/dab/fic.rs` (`FicDecoder::from_bytes`) decodes FIB CRC, FIG 0/0, 0/1, 0/2, 0/3, 0/5, 0/9, 0/10, 0/13 and FIG 1/0, 1/1 (label plus short-label mask). Its bit layouts agree with EN 300 401 and C++ for everything the mux emits. Running `FicCarousel` output through it in unit tests would verify every field the mux emits against a decoder written by someone else. Finding 1 is exactly the kind of bug that shows up in such a test.
 

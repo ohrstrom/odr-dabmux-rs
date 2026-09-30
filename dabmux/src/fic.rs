@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::config::{short_label_mask, SubchannelKind, ValidatedConfig};
+use crate::config::{encode_label, short_label_mask, SubchannelKind, ValidatedConfig};
 use dabmux::frame::FrameClock;
 
 pub struct FicCarousel {
@@ -298,7 +298,7 @@ fn fig0_10(clock: FrameClock) -> [u8; 8] {
         ((mjd >> 2) & 0xff) as u8,
         (((mjd & 3) << 6) | ((hour >> 2) & 7) | 0x18) as u8,
         ((minute & 0x3f) | ((hour & 3) << 6)) as u8,
-        ((second & 0x3f) | (((millis >> 8) & 3) << 6)) as u8,
+        (((second & 0x3f) << 2) | ((millis >> 8) & 3)) as u8,
         millis as u8,
     ]
 }
@@ -309,7 +309,8 @@ fn fig1_label(extension: u8, id: u16, label: &str, short_label: Option<&str>) ->
     fig[1] = extension;
     fig[2..4].copy_from_slice(&id.to_be_bytes());
     fig[4..20].fill(b' ');
-    fig[4..4 + label.len()].copy_from_slice(label.as_bytes());
+    let encoded = encode_label("label", label).expect("validated label");
+    fig[4..4 + encoded.len()].copy_from_slice(&encoded);
     let mask = short_label_mask("short_label", label, short_label).expect("validated short label");
     fig[20..22].copy_from_slice(&mask.to_be_bytes());
     fig
@@ -515,5 +516,209 @@ mod tests {
             }
         }
         assert_eq!(totals, [12, 12, 12]);
+    }
+}
+
+/// Round trips through the vendored EDInburgh decoder, an independent reading of
+/// EN 300 401, so that bit-layout mistakes in the writers cannot hide behind
+/// tests derived from the writers themselves.
+#[cfg(test)]
+mod oracle_tests {
+    use super::*;
+    use crate::config::{
+        ComponentConfig, Config, InputConfig, InputTiming, ProtectionConfig, ServiceConfig,
+        SubchannelConfig, UserApplication,
+    };
+    use crate::testsupport::edinburgh::fic::{DateTimeUTC, FicDecoder, Fig};
+    use crate::testsupport::edinburgh::tables;
+    use std::collections::{HashMap, HashSet};
+
+    fn decode(fic: &[u8]) -> Vec<Fig> {
+        for fib in fic.chunks(32) {
+            assert_eq!(&fib[30..], &dabmux::edi::crc16(&fib[..30]).to_be_bytes());
+        }
+        FicDecoder::from_bytes(fic).unwrap()
+    }
+
+    fn twelve_service_config() -> ValidatedConfig {
+        let mut config: Config =
+            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        config.ensemble.label = "Grüezi Mux".into();
+        config.ensemble.short_label = Some("Grüezi".into());
+        config.ensemble.international_table = 1;
+        config.ensemble.local_time_offset_half_hours = 2;
+        config.services.clear();
+        config.subchannels.clear();
+        config.components.clear();
+        for index in 0..12u8 {
+            let (label, short_label) = if index == 0 {
+                ("Radio Zürich 1".to_string(), Some("Zürich".to_string()))
+            } else {
+                (format!("Station {index}"), None)
+            };
+            config.services.push(ServiceConfig {
+                uid: format!("service_{index}"),
+                id: 0x4001 + u32::from(index),
+                label,
+                short_label,
+                pty: 15,
+                language: 8,
+            });
+            config.subchannels.push(SubchannelConfig {
+                uid: format!("sub_{index}"),
+                id: index + 1,
+                bitrate: [72, 64, 48][usize::from(index / 4)],
+                kind: SubchannelKind::DabPlus,
+                protection: if index == 4 {
+                    ProtectionConfig::EepB { level: 2 }
+                } else {
+                    ProtectionConfig::EepA { level: 3 }
+                },
+                input: InputConfig::Edi {
+                    uri: format!("tcp://127.0.0.1:{}", 9001 + u16::from(index)),
+                    stream_index: 1,
+                    buffer_frames: 40,
+                    prebuffer_frames: 4,
+                    timing: InputTiming::Prebuffering,
+                },
+            });
+            config.components.push(ComponentConfig {
+                uid: format!("component_{index}"),
+                service: format!("service_{index}"),
+                subchannel: format!("sub_{index}"),
+                user_applications: vec![UserApplication::Slideshow],
+            });
+        }
+        config.validate().unwrap()
+    }
+
+    #[test]
+    fn decoder_sees_complete_and_correct_ensemble_description() {
+        let valid = twelve_service_config();
+        let source = &valid.source;
+        let mut carousel = FicCarousel::new();
+        let mut subchannels = HashMap::new();
+        let mut components = HashMap::new();
+        let mut languages = HashMap::new();
+        let mut applications = HashMap::new();
+        let mut labels = HashMap::new();
+        let mut ensemble_label = None;
+        let mut fig0_9_seen = false;
+        for count in 0..100 {
+            let fic = carousel
+                .write(&valid, FrameClock::new(count, 0, 0).unwrap())
+                .unwrap();
+            let figs = decode(&fic);
+            assert!(
+                figs.iter()
+                    .any(|fig| matches!(fig, Fig::F0_0(f) if f.eid == source.ensemble.id)),
+                "FIG 0/0 missing in frame {count}"
+            );
+            for fig in figs {
+                match fig {
+                    Fig::F0_1(f) => {
+                        for sub in f.subchannels {
+                            subchannels.insert(sub.id, (sub.start, sub.size, sub.pl, sub.bitrate));
+                        }
+                    }
+                    Fig::F0_2(f) => {
+                        for c in f.services {
+                            components.insert(c.sid, (c.tmid, c.scid, c.primary, c.ca));
+                        }
+                    }
+                    Fig::F0_5(f) => {
+                        for l in f.services {
+                            languages.insert(l.scid, l.language);
+                        }
+                    }
+                    Fig::F0_9(f) => {
+                        assert_eq!((f.ecc, f.int_table_id, f.lto), (source.ensemble.ecc, 1, 1));
+                        fig0_9_seen = true;
+                    }
+                    Fig::F0_13(f) => {
+                        for s in f.services {
+                            applications.insert(s.sid, (s.scids, s.uas));
+                        }
+                    }
+                    Fig::F1_0(f) => ensemble_label = Some((f.eid, f.label, f.short_label)),
+                    Fig::F1_1(f) => {
+                        labels.insert(f.sid, (f.label, f.short_label));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(fig0_9_seen);
+        assert_eq!(
+            ensemble_label,
+            Some((source.ensemble.id, "Grüezi Mux".into(), "Grüezi".into()))
+        );
+        for (sub, raw) in valid.subchannels.iter().zip(&source.subchannels) {
+            let expected_pl = match raw.protection {
+                ProtectionConfig::EepA { level } => format!("EEP {level}-A"),
+                ProtectionConfig::EepB { level } => format!("EEP {level}-B"),
+            };
+            assert_eq!(
+                subchannels.get(&sub.id),
+                Some(&(
+                    usize::from(sub.start_address_cu),
+                    Some(usize::from(sub.size_cu)),
+                    Some(expected_pl),
+                    Some(usize::from(sub.bitrate)),
+                )),
+                "FIG 0/1 for {}",
+                sub.uid
+            );
+        }
+        let sids: HashSet<_> = source.services.iter().map(|s| s.id as u16).collect();
+        for (service, sub) in source.services.iter().zip(&valid.subchannels) {
+            let sid = service.id as u16;
+            assert_eq!(components.get(&sid), Some(&(0, sub.id, true, false)));
+            assert_eq!(languages.get(&sub.id), Some(&tables::Language::Deu));
+            assert_eq!(
+                applications.get(&sid),
+                Some(&(0, vec![tables::UserApplication::Sls]))
+            );
+            let short: String = match &service.short_label {
+                Some(short) => short.clone(),
+                None => service.label.chars().take(8).collect(),
+            };
+            assert_eq!(labels.get(&sid), Some(&(service.label.clone(), short)));
+        }
+        assert_eq!(components.len(), sids.len());
+    }
+
+    #[test]
+    fn decoder_reads_fig0_10_date_and_time() {
+        let valid = twelve_service_config();
+        let mut carousel = FicCarousel::new();
+        // 2024-01-02 03:04:05.678 UTC, on a frame that carries FIG 0/10.
+        let fic = carousel
+            .write(&valid, FrameClock::new(4, 1_704_164_645, 678).unwrap())
+            .unwrap();
+        let time = decode(&fic)
+            .into_iter()
+            .find_map(|fig| match fig {
+                Fig::F0_10(f) => Some(f),
+                _ => None,
+            })
+            .expect("FIG 0/10 on frame phase 0");
+        assert!(time.utc_flag && !time.lsi);
+        match time.utc {
+            DateTimeUTC::Long {
+                year,
+                month,
+                day,
+                hours,
+                minutes,
+                seconds,
+                milliseconds,
+            } => assert_eq!(
+                (year, month, day, hours, minutes, seconds, milliseconds),
+                (2024, 1, 2, 3, 4, 5, 678)
+            ),
+            DateTimeUTC::Short { .. } => panic!("expected long-form UTC"),
+        }
     }
 }

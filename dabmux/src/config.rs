@@ -581,31 +581,33 @@ fn validate_uid(kind: &str, uid: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_label(path: &str, label: &str) -> anyhow::Result<()> {
-    if label.is_empty()
-        || label.len() > 16
-        || !label.is_ascii()
-        || label.chars().any(|c| c.is_ascii_control())
-    {
-        bail!("{path} must contain 1..=16 printable ASCII characters");
+/// Encode a label for FIG 1 (EBU Latin, one byte per character).
+pub fn encode_label(path: &str, label: &str) -> anyhow::Result<Vec<u8>> {
+    let encoded = dabmux::charset::encode(label).map_err(|err| anyhow::anyhow!("{path}: {err}"))?;
+    if encoded.is_empty() || encoded.len() > 16 {
+        bail!("{path} must contain 1..=16 EBU Latin characters");
     }
-    Ok(())
+    Ok(encoded)
+}
+
+fn validate_label(path: &str, label: &str) -> anyhow::Result<()> {
+    encode_label(path, label).map(drop)
 }
 
 pub fn short_label_mask(path: &str, label: &str, short_label: Option<&str>) -> anyhow::Result<u16> {
-    if label.len() > 16 {
-        bail!("{path} full label exceeds 16 characters");
-    }
+    let label = encode_label(path, label)?;
     let Some(short_label) = short_label else {
         return Ok(0xff00);
     };
-    if short_label.is_empty() || short_label.len() > 8 || !short_label.is_ascii() {
-        bail!("{path} must contain 1..=8 printable ASCII characters from the full label");
+    let short_label =
+        dabmux::charset::encode(short_label).map_err(|err| anyhow::anyhow!("{path}: {err}"))?;
+    if short_label.is_empty() || short_label.len() > 8 {
+        bail!("{path} must contain 1..=8 characters from the full label");
     }
-    let mut remaining = short_label.bytes();
+    let mut remaining = short_label.into_iter();
     let mut wanted = remaining.next();
     let mut mask = 0u16;
-    for (position, character) in label.bytes().enumerate() {
+    for (position, character) in label.into_iter().enumerate() {
         if Some(character) == wanted {
             mask |= 0x8000 >> position;
             wanted = remaining.next();
@@ -772,6 +774,19 @@ mod tests {
         assert!(short_label_mask("short_label", "HELIUM RND-004", Some("HRND-004")).is_ok());
         assert!(short_label_mask("short_label", "Radio One", Some("Other")).is_err());
         assert!(short_label_mask("short_label", "Radio One", Some("Radio One")).is_err());
+    }
+
+    #[test]
+    fn labels_are_ebu_latin_not_ascii() {
+        assert_eq!(
+            short_label_mask("short_label", "Radio Zürich 1", Some("Zürich")).unwrap(),
+            0x03f0
+        );
+        assert!(validate_label("service.label", "Grüezi Gämsli").is_ok());
+        assert!(validate_label("service.label", "Sechzehn Zeichenü").is_err());
+        let err = validate_label("service.label", "Radio ~").unwrap_err();
+        assert!(err.to_string().contains("service.label"));
+        assert!(err.to_string().contains("EBU Latin"));
     }
 
     #[test]
