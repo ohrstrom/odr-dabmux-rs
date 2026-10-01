@@ -1,0 +1,25 @@
+services:
+
+  #####################################################################
+  # encoder
+  #####################################################################
+  encoder:
+    build:
+      context: ${PWD}/
+      dockerfile: ${PWD}/encoder/Dockerfile
+    image: dabmux/encoder:latest
+    ports:
+      - "18900:8900" # supervisord
+    extra_hosts:
+      # encoder.liq sends to tcp://mux:<9000 + id>; the mux runs on the host
+      - "mux:host-gateway"
+    volumes:
+      # NOTE: we also copy this in Dockerfile - so this is
+      #       only needed to update without rebuilding
+      - ${PWD}/encoder/supervisor.d/:/encoder/supervisor.d/
+      - ${PWD}/encoder/run/:/encoder/run/
+    networks:
+      - dabmux
+
+networks:
+  dabmux:

@@ -1,6 +1,6 @@
 # Production multiplex configuration gap audit
 
-Compared on 2026-09-30 against the supplied `he2-mux` INFO configuration, `__ref/ODR-DabMux/doc/advanced.mux`, the C++ parser/FIG writers, and the Rust code. A validated conversion is available as [`dabmux/config.production.example.yaml`](../dabmux/config.production.example.yaml). Rust intentionally has a smaller input/output and operations scope.
+Compared on 2026-09-30 against the supplied `he2-mux` INFO configuration, `__ref/ODR-DabMux/doc/advanced.mux`, the C++ parser/FIG writers, and the Rust code. A validated conversion is available as [`dabmux/config.production.example.yaml`](../dabmux/config.production.example.yaml); the mux-zh reference config is covered [below](#mux-zh-reference-configuration). Rust intentionally has a smaller input/output and operations scope.
 
 ## Production fields
 
@@ -9,15 +9,15 @@ Compared on 2026-09-30 against the supplied `he2-mux` INFO configuration, `__ref
 | `dabmode 1`, `nbframes 0`, `throttle "simul://"` | Implemented | Mode I and a continuous 24 ms real-time frame loop. There is no frame-count or throttle option. |
 | Ensemble `id`, `ecc`, `international-table`, `label` | Implemented | YAML `ensemble.id`, `ecc`, `international_table`, `label`; FIG 0/0, 0/9 and FIG 1. |
 | Ensemble `shortlabel "RND D00"` | Implemented | YAML `ensemble.short_label`. FIG 1 carries a character-selection mask, independently decoded by DABlin. Omission selects the first eight positions, matching C++ default. |
-| Twelve service IDs, full labels and short labels | Implemented | YAML `services[]` and `short_label`; FIG 0/2 and FIG 1. Labels are UTF-8 in YAML and sent as EBU Latin, like C++. The supplied 12-service graph fits the current audio model. |
+| Twelve service IDs, full labels and short labels | Implemented | YAML `services[]` with `id`, `label` and `short_label`; FIG 0/2 and FIG 1. Labels are UTF-8 in YAML and sent as EBU Latin, like C++. The supplied 12-service graph fits the current audio model. |
 | Service `pty 15` | Implemented | YAML `services[].pty`; static FIG 0/17. DABlin decoded `Other Music` with international table 1. |
 | Service `language 0x08` | Implemented | YAML `services[].language`; FIG 0/5. DABlin decoded German on all 12 subchannels. |
-| Twelve DAB+ EDI/TCP inputs, EEP-A level 3, subchannel IDs and bitrates | Implemented | YAML `kind: dab_plus`, `protection: {profile: eep_a, level: 3}`, `input: {protocol: edi, uri: tcp://...}`. The supplied 4×72 + 4×64 + 4×48 kbit/s arrangement uses 552 of 864 CUs. TCP inputs throttle their encoder by default (`backpressure`); a newer producer connection replaces the previous one, and a producer silent for 10 s is disconnected. |
-| Service-to-subchannel components | Implemented | YAML `components[]`; FIG 0/2 identifies the audio components. |
-| `user-applications { userapp "slideshow" }` on every component | Implemented | YAML `components[].user_applications: [slideshow]`; FIG 0/13 signals application type `0x2`, X-PAD application type `12` and MOT DSCTy `60`. DABlin decoded Slideshow on the 12-service test stream. Each service has a single component; Rust accepts user applications only on a service's first component because FIG 0/8 is not emitted. |
+| Twelve DAB+ EDI/TCP inputs, EEP-A level 3, subchannel IDs and bitrates | Implemented | Each service's component: `type: dab_plus`, `subchannel_id`, `bitrate`, `input: {protocol: edi, uri: tcp://...}`; EEP 3-A is the default protection (`defaults.protection` or per-component `protection`). The supplied 4×72 + 4×64 + 4×48 kbit/s arrangement uses 552 of 864 CUs. TCP inputs throttle their encoder by default (`backpressure`); a newer producer connection replaces the previous one, and a producer silent for 10 s is disconnected. |
+| Service-to-subchannel components | Implemented | YAML `services[].components[]`; each component defines its own subchannel, so no service/component/subchannel uids are wired by hand. FIG 0/2 identifies the audio components. |
+| `user-applications { userapp "slideshow" }` on every component | Implemented | YAML `services[].components[].user_applications: [slideshow]`; FIG 0/13 signals application type `0x2`, X-PAD application type `12` and MOT DSCTy `60`. DABlin decoded Slideshow on the 12-service test stream. Each service has a single component; Rust accepts user applications only on a service's first component because FIG 0/8 is not emitted. |
 | `tist true` | Implemented | TIST and EDI timestamps use either a fixed TAI–UTC offset or configured bulletin URLs. |
 | `tist_offset 2` | Implemented | YAML `ensemble.tist_offset_ms: 2000`; a live DETI check measured approximately 1.986 seconds of lead, and a live update to zero changed it to approximately −0.013 seconds. |
-| `tai_clock_bulletins ...` | Implemented | Pipe-separated HTTPS URLs are tried in order at startup and refreshed hourly. A valid expired bulletin is a last resort, with a warning. There is no persistent cache across process restarts. |
+| `tai_clock_bulletins ...` | Implemented | YAML `ensemble.tai_clock_bulletins` lists HTTPS URLs, tried in order at startup and refreshed hourly. A valid expired bulletin is a last resort, with a warning. There is no persistent cache across process restarts. |
 | `local-time-offset auto` | Implemented | YAML `ensemble.local_time_offset_auto: true` reads the host timezone for FIG 0/9, including daylight-saving changes. The test stream decoded as +02:00 in the current host timezone. |
 | EDI TCP listener on port 8850, `enable_pft false` | Implemented | YAML TCP EDI output sends AF packets. PFT/FEC is not used on TCP. |
 | `max_frames_queued 500` | Implemented | YAML TCP destination `max_frames_queued: 500`; each client has an exact bounded queue and is dropped when it fills. |
@@ -29,6 +29,21 @@ Compared on 2026-09-30 against the supplied `he2-mux` INFO configuration, `__ref
 | Reconfiguration counter | Not set | The production config sets none, so FIG 0/7 is not sent. If `ensemble.reconfiguration_counter` is set, structural hot reloads advance it automatically. |
 
 The supplied layout totals **736 kbit/s**, **552 CUs**, **12 EST payloads** and **2208 MSC bytes per frame**. The FIG carousel completes the 12-service PTY/language/slideshow metadata cycle within 48 frames (1.152 seconds). DABlin independently decoded the full 12-service signalling from the live Rust stream. The converted YAML validates, but its bulletin URLs and real input feeds have not been exercised on the deployment host.
+
+## mux-zh reference configuration
+
+[`docs/reference-configs/mux-zh/mux.conf`](reference-configs/mux-zh/mux.conf) has 17 DAB+ services and an SPI data service. Its audio part converts to [`dabmux/config.mux-zh.example.yaml`](../dabmux/config.mux-zh.example.yaml), which validates and runs: 822 of 864 CUs, with `buffer 100` / `prebuffering 30` expressed once as `defaults.edi`. With SPI it would use 828 CUs.
+
+| Setting | Rust status | Needed |
+| --- | --- | --- |
+| `srv-spi`, `id 0x44010001` | Missing | 32-bit data service IDs (rejected today), FIG 0/2 data service entries, FIG 1/5 labels. |
+| `type enhancedpacket`, `bitrate 8` | Missing | Packet-mode subchannel and enhanced-packet FEC: RS(204,188) over a 12×188 frame, 9 FEC packets at address 1022, FIG 0/14. |
+| `inputproto file`, `load_entire_file true` | Missing | File input that reads one frame of packets per tick, loops, pads with null packets, and re-reads the file on each loop like C++, so a regenerated `spi.bin` is picked up. `spi.bin` holds 21,724 ready-made 24-byte packets at address 1. |
+| Component `type 60`, `address 0x1`, `datagroup true`, `userapp "spi"` | Missing | FIG 0/3 and FIG 0/13 with SPI (0x7) for packet components. The address must match the packet headers in the file. |
+| Service `ecc 0xE0` (BOLLERWAGEN, 0x1498) | Missing | Per-service ECC and the FIG 0/9 extended field. Without it, the service is signalled with ECC E1. |
+| `outputs.zeromq` on `tcp://*:8950` | Out of scope by design | Needed only if a consumer of port 8950 cannot move to EDI. |
+
+Two values in the C++ config are worth checking with the operator: `0x44010001` decodes as ECC 0x44 and country 0 rather than E1/4, and `srv-rockantenne` (`0x121B`, a German ID) has no `ecc 0xE0`.
 
 ## Short-label semantics
 

@@ -12,7 +12,7 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 
 use crate::config::{
     ConfigUpdate, EdiDestination, InputConfig, InputEndpoint, InputTiming, SharedConfig,
-    SubchannelConfig, SubchannelKind, Transport, ValidatedConfig,
+    Subchannel, SubchannelKind, Transport, ValidatedConfig,
 };
 use crate::fic::FicCarousel;
 use crate::timing::{TaiClock, TaiSource};
@@ -416,7 +416,7 @@ enum InputSocket {
 
 struct InputHandle {
     endpoint: InputEndpoint,
-    config: SubchannelConfig,
+    config: Subchannel,
     socket: InputSocket,
     task: tokio::task::JoinHandle<()>,
     buffered: BufferedInput,
@@ -426,8 +426,8 @@ struct InputHandle {
 
 impl InputHandle {
     /// Only the input settings and the frame size matter to a running
-    /// receiver; ID, protection and uid changes are applied in place.
-    fn serves(&self, endpoint: InputEndpoint, sub: &SubchannelConfig) -> bool {
+    /// receiver; ID, protection and name changes are applied in place.
+    fn serves(&self, endpoint: InputEndpoint, sub: &Subchannel) -> bool {
         self.endpoint == endpoint
             && self.config.input == sub.input
             && self.config.bitrate == sub.bitrate
@@ -584,7 +584,7 @@ async fn prepare_resources(
 }
 
 fn start_input(
-    subchannel: SubchannelConfig,
+    subchannel: Subchannel,
     endpoint: InputEndpoint,
     socket: InputSocket,
     stats: Arc<RuntimeStats>,
@@ -977,6 +977,18 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             } else {
                 clock = next_clock;
                 let structure_changed = mci(&candidate) != mci(&active);
+                let reallocated = candidate.reallocated_subchannels(&active);
+                if !reallocated.is_empty() {
+                    let changes = reallocated
+                        .iter()
+                        .map(|(name, from, to)| format!("{name} {from}->{to}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::warn!(
+                        %changes,
+                        "allocated SubChIds changed; receivers lose these services until they rescan; set subchannel_id to keep them stable"
+                    );
+                }
                 let tai_offset = resources.tai_offset;
                 commit_resources(
                     &candidate,
@@ -1019,7 +1031,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             let data = match input.buffered.take(clock, &stats) {
                 Some(data) if data.len() == sub.payload_bytes => {
                     if input.underflowing {
-                        tracing::info!(subchannel = %sub.uid, "input recovered");
+                        tracing::info!(subchannel = %sub.name, "input recovered");
                         input.underflowing = false;
                     }
                     data
@@ -1027,7 +1039,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 data => {
                     stats.input_underflows.fetch_add(1, Ordering::Relaxed);
                     if !input.underflowing {
-                        tracing::warn!(subchannel = %sub.uid, received_bytes = ?data.as_ref().map(Vec::len), expected_bytes = sub.payload_bytes, "input underflow; substituting silence");
+                        tracing::warn!(subchannel = %sub.name, received_bytes = ?data.as_ref().map(Vec::len), expected_bytes = sub.payload_bytes, "input underflow; substituting silence");
                         input.underflowing = true;
                     }
                     vec![0u8; sub.payload_bytes]
@@ -1088,7 +1100,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                     } else {
                         "pace the encoder in real time"
                     };
-                    tracing::warn!(subchannel = %sub.uid, dropped, hint, "input delivers frames faster than real time; dropping frames breaks DAB+ superframes");
+                    tracing::warn!(subchannel = %sub.name, dropped, hint, "input delivers frames faster than real time; dropping frames breaks DAB+ superframes");
                 }
             }
             if let Ok(now) = unix_millis_now() {
@@ -1215,24 +1227,23 @@ mod tests {
 
     #[test]
     fn only_multiplex_organisation_counts_as_structure() {
-        let base: crate::config::Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let base = crate::config::testing::example();
         let active = base.clone().validate().unwrap();
 
         let mut label = base.clone();
         label.services[0].label = "Other Label".into();
-        label.subchannels[0].input = InputConfig::Edi {
+        label.services[0].components[0].input = Some(crate::config::schema::InputSpec::Edi {
             uri: "udp://127.0.0.1:9100".into(),
-            stream_index: 1,
-            buffer_frames: 40,
-            prebuffer_frames: 4,
-            timing: InputTiming::Prebuffering,
+            stream_index: None,
+            buffer_frames: Some(80),
+            prebuffer_frames: None,
+            timing: None,
             backpressure: None,
-        };
+        });
         assert_eq!(mci(&label.validate().unwrap()), mci(&active));
 
         let mut bitrate = base.clone();
-        bitrate.subchannels[0].bitrate = 104;
+        bitrate.services[0].components[0].bitrate = Some(104);
         assert_ne!(mci(&bitrate.validate().unwrap()), mci(&active));
 
         let mut sid = base;

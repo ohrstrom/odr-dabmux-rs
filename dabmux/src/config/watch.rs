@@ -59,7 +59,7 @@ pub async fn watch_config_file(path: PathBuf, config: SharedConfig) -> anyhow::R
                     Ok(true) => tracing::info!("config reloaded successfully"),
                     Ok(false) => tracing::trace!("config reload ignored (content unchanged)"),
                     Err(e) => {
-                        tracing::warn!("config reload failed: {e}");
+                        tracing::warn!("config reload failed: {e:#}");
                     }
                 }
             }

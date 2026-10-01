@@ -1,0 +1,233 @@
+# Rust counterpart of docs/reference-configs/mux-zh/mux.conf (audio services).
+# Not yet covered: the SPI data service (srv-spi, enhanced packet subchannel 30
+# fed from spi.bin), the per-service ECC 0xE0 of BOLLERWAGEN (0x1498), and the
+# ZeroMQ output on tcp://*:8950. SubChIds are configured explicitly so that
+# receivers keep their services across configuration changes.
+
+ensemble:
+  id: 0x4401
+  ecc: 0xe1
+  label: DIG D04 - ZH
+  short_label: DIG D04
+  mode: 1
+  tist: true
+  tist_offset_ms: 2000
+  tai_clock_bulletins:
+    - https://hpiers.obspm.fr/iers/bul/bulc/ntp/leap-seconds.list
+    - https://raw.githubusercontent.com/eggert/tz/master/leap-seconds.list
+  local_time_offset_auto: true
+  international_table: 1
+
+defaults:
+  protection: {profile: eep_a, level: 3}
+  edi: {buffer_frames: 100, prebuffer_frames: 30}
+
+services:
+  - id: 0x4f32
+    label: Radio X
+    short_label: Radio X
+    pty: 15
+    language: 0x0f
+    components:
+      - type: dab_plus
+        subchannel_id: 1
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9000"}
+        user_applications: [slideshow]
+
+  - id: 0x4002
+    label: Stadtfilter
+    short_label: Stadtflt
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 2
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9001"}
+        user_applications: [slideshow]
+
+  - id: 0x4f2c
+    label: Kanal K
+    short_label: Kanal K
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 3
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9002"}
+        user_applications: [slideshow]
+
+  - id: 0x4ed9
+    label: Sout Al Khaleej
+    short_label: Sout A K
+    pty: 15
+    components:
+      - type: dab_plus
+        subchannel_id: 4
+        bitrate: 48
+        protection: {profile: eep_a, level: 4}
+        input: {protocol: edi, uri: "tcp://:9039"}
+        user_applications: [slideshow]
+
+  - id: 0x4de6
+    label: albradio ON AIR
+    short_label: albradio
+    pty: 9
+    language: 0x01
+    components:
+      - type: dab_plus
+        subchannel_id: 5
+        bitrate: 48
+        protection: {profile: eep_a, level: 4}
+        input: {protocol: edi, uri: "tcp://:9127"}
+        user_applications: [slideshow]
+
+  - id: 0x4da4
+    label: "0PENBR0ADCAST"
+    short_label: "0PENBC"
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 6
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9005"}
+        user_applications: [slideshow]
+
+  - id: 0x4001
+    label: LoRa
+    short_label: LoRa
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 7
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9006"}
+        user_applications: [slideshow]
+
+  - id: 0x4db4
+    label: GDS.FM
+    short_label: GDS.FM
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 8
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9007"}
+        user_applications: [slideshow]
+
+  - id: 0x4edd
+    label: Positive
+    short_label: Positive
+    pty: 15
+    language: 0x0f
+    components:
+      - type: dab_plus
+        subchannel_id: 9
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9041"}
+        user_applications: [slideshow]
+
+  - id: 0x1498
+    label: BOLLERWAGEN
+    short_label: BOLLER
+    pty: 10
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 10
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9055"}
+        user_applications: [slideshow]
+
+  - id: 0x4ee9
+    label: Suisse Podcast
+    short_label: Podcast
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 12
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9087"}
+        user_applications: [slideshow]
+
+  - id: 0x4f40
+    label: "3FACH"
+    short_label: "3FACH"
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 13
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9015"}
+        user_applications: [slideshow]
+
+  - id: 0x4d51
+    label: RADIO4TNG
+    short_label: RADIO4
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 14
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9054"}
+        user_applications: [slideshow]
+
+  - id: 0x4d95
+    label: RUNDFUNK
+    short_label: RUNDFUNK
+    pty: 15
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 15
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9049"}
+        user_applications: [slideshow]
+
+  - id: 0x4ac1
+    label: Radio ZueriLeu
+    short_label: ZueriLeu
+    pty: 10
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 16
+        bitrate: 48
+        input: {protocol: edi, uri: "tcp://:9012"}
+        user_applications: [slideshow]
+
+  - id: 0x4dcf
+    label: "105 DJ RADIO"
+    short_label: DJ RADIO
+    pty: 10
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 18
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9115"}
+        user_applications: [slideshow]
+
+  - id: 0x121b
+    label: ROCK ANTENNE
+    short_label: ROCK ANT
+    pty: 11
+    language: 0x08
+    components:
+      - type: dab_plus
+        subchannel_id: 19
+        bitrate: 48
+        input: {protocol: edi, uri: "tcp://:9094"}
+        user_applications: [slideshow]
+
+output:
+  tagpacket_alignment: 16
+  destinations:
+    - {protocol: tcp, listen_port: 8850, max_frames_queued: 500, preroll_ms: 3500}

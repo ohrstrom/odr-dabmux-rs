@@ -1,37 +1,54 @@
 ensemble:
-  id: 20479
-  ecc: 225
+  id: 0x4fff
+  ecc: 0xe1
   label: Example Mux
   mode: 1
   tist: false
 
 services:
-  - uid: radio_one
-    id: 19875
-    label: Radio X
-
-subchannels:
-  - uid: audio_one
-    id: 1
-    bitrate: 72
-    kind: dab_plus
-    protection:
-      profile: eep_a
-      level: 3
-    input:
-      protocol: edi
-      uri: tcp://127.0.0.1:9000
-      # TCP inputs throttle the encoder by default (backpressure), which an
-      # unpaced file encoder (odr-audioenc -i file.wav) needs. For a live
-      # encoder, `backpressure: false` drops frames instead, absorbing drift.
-      # backpressure: false
-
-components:
-  - uid: component_one
-    service: radio_one
-    subchannel: audio_one
+  - id: 0x4d01
+    label: Program 1
+    short_label: P1
+    components:
+      # The component's subchannel is created implicitly. Protection defaults
+      # to EEP 3-A, and the SubChId is allocated unless `subchannel_id` is set.
+      - type: dab_plus
+        subchannel_id: 1
+        bitrate: 88
+        user_applications: [slideshow]
+        input:
+          protocol: edi
+          uri: tcp://127.0.0.1:9001
+          # TCP inputs throttle the encoder by default (backpressure), which an
+          # unpaced file encoder (odr-audioenc -i file.wav) needs. For a live
+          # encoder, `backpressure: false` drops frames instead, absorbing drift.
+          # backpressure: false
+  - id: 0x4d02
+    label: Program 2X
+    short_label: P2X
+    components:
+      - type: dab_plus
+        subchannel_id: 2
+        bitrate: 72
+        user_applications: [slideshow]
+        input:
+          protocol: edi
+          uri: tcp://127.0.0.1:9002
+          # backpressure: false
+  - id: 0x4d03
+    label: Program 3
+    short_label: P3
+    components:
+      - type: dab_plus
+        subchannel_id: 3
+        bitrate: 72
+        user_applications: [slideshow]
+        input:
+          protocol: edi
+          uri: tcp://127.0.0.1:9003
+          # backpressure: false
 
 output:
   destinations:
     - protocol: tcp
-      listen_port: 9001
+      listen_port: 9000

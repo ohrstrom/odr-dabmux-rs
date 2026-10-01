@@ -16,7 +16,7 @@ const NTP_UNIX_EPOCH_DELTA: i64 = 2_208_988_800;
 pub enum TaiSource {
     Disabled,
     Fixed(u8),
-    Bulletins(String),
+    Bulletins(Vec<String>),
 }
 
 impl TaiSource {
@@ -26,12 +26,7 @@ impl TaiSource {
         } else if let Some(offset) = config.tai_utc_offset {
             Self::Fixed(offset)
         } else {
-            Self::Bulletins(
-                config
-                    .tai_clock_bulletins
-                    .clone()
-                    .expect("validated TAI source"),
-            )
+            Self::Bulletins(config.tai_clock_bulletins.clone())
         }
     }
 
@@ -151,14 +146,14 @@ fn parse_ietf_bulletin_any(text: &str, now_unix: i64) -> Result<(u8, bool)> {
     Ok((offset, expiry <= now_unix))
 }
 
-async fn fetch_bulletin_offset(urls: &str) -> Result<u8> {
+async fn fetch_bulletin_offset(urls: &[String]) -> Result<u8> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
     let now = chrono::Utc::now().timestamp();
     let mut errors = Vec::new();
     let mut expired_fallback = None;
-    for url in urls.split('|') {
+    for url in urls {
         let result = async {
             let response = client.get(url).send().await?.error_for_status()?;
             let text = response.text().await?;

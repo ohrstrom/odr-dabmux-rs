@@ -1,31 +1,20 @@
 ensemble:
-  id: 20479
-  ecc: 225
+  id: 0x4fff
+  ecc: 0xe1
   label: Example Mux
   mode: 1
   tist: false
 
 services:
-  - uid: radio_one
-    id: 19876
+  - id: 0x4da4
     label: Radio One
-
-subchannels:
-  - uid: audio_one
-    id: 1
-    bitrate: 96
-    kind: dab_plus
-    protection:
-      profile: eep_a
-      level: 3
-    input:
-      protocol: edi
-      uri: udp://127.0.0.1:9000
-
-components:
-  - uid: component_one
-    service: radio_one
-    subchannel: audio_one
+    components:
+      - type: dab_plus
+        subchannel_id: 1
+        bitrate: 96
+        input:
+          protocol: edi
+          uri: udp://127.0.0.1:9000
 
 output:
   destinations:

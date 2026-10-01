@@ -34,3 +34,16 @@ dablin -f edi -1 -u /tmp/out.edi > /tmp/out.aac
 ```
 
 DABlin should report one superframe sync and no `(AU #n)` errors.
+
+
+## Devsupport - Containered odr-audioenc
+
+```shell
+docker compose up -d
+```
+
+### Reload script (supervisor update after config change)
+
+```shell
+uv run encoder-ctl.py update
+```

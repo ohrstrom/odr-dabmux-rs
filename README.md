@@ -12,7 +12,29 @@ The example expects an EDI input on TCP port 9000 and serves EDI on TCP port 900
 
 Use `--watch-config` for validated file reloads; `POST /api/config` accepts a complete JSON configuration. Services, components, subchannels, IDs, input bindings, output destinations and ensemble settings can all change live. The API reports success after the new configuration activates at the start of a transmission frame. If validation or binding a new endpoint fails, the active configuration continues. For a bitrate change, stop the old encoder and start one configured for the new bitrate; `/api/stats` counts wrong-size frames as `input_size_mismatches`. Existing receivers such as DABlin may need to reconnect after a structural change, because advance reconfiguration signalling is not yet implemented.
 
-The supplied 12-service INFO configuration has a validated Rust counterpart at [config.production.example.yaml](dabmux/config.production.example.yaml). It includes PTY, language, slideshow signalling, automatic local time offset, TAI bulletin URLs, a 2-second TIST lead, and the TCP queue, preroll and TAG alignment settings. Check the host timezone and HTTPS bulletin access before using it on air.
+## Configuration
+
+Services own their components, and each component normally defines its own subchannel; [docs/specs/configuration.md](docs/specs/configuration.md) describes the model.
+
+```yaml
+services:
+  - id: 0x4f32
+    label: Radio X
+    components:
+      - type: dab_plus
+        subchannel_id: 1
+        bitrate: 72
+        input: {protocol: edi, uri: "tcp://:9000"}
+        user_applications: [slideshow]
+```
+
+- **SubChIds.** `subchannel_id` is optional. Unset IDs take the lowest ID not configured elsewhere, in service and component order, so adding or removing a service can renumber the services after it. Receivers then lose those services until they rescan, and the mux logs a warning on reload. Set `subchannel_id` on air.
+- **Shared subchannels.** A subchannel used by several components is defined once in the top-level `subchannels` map and referenced by name with `subchannel: <name>`. A reference carries no subchannel settings, and every named subchannel must be used.
+- **Defaults.** Protection is EEP 3-A unless `defaults.protection` or the component sets it. `defaults.edi` sets `buffer_frames`, `prebuffer_frames`, `timing` and `backpressure` for EDI inputs that leave them unset; the `backpressure` default applies to TCP inputs only.
+- **Numbers.** IDs, ECC, PTY and language accept integers or strings such as `"0x4F32"`, since JSON has no hexadecimal literals.
+- **Errors** name the field, for example `services[2] (4F2C).components[0] refers to unknown subchannel "x"`. `GET /api/config/resolved` shows the configuration as the mux runs it, with allocated SubChIds, CU addresses and defaults filled in.
+
+The supplied 12-service INFO configuration has a validated Rust counterpart at [config.production.example.yaml](dabmux/config.production.example.yaml), and the audio services of the mux-zh reference config at [config.mux-zh.example.yaml](dabmux/config.mux-zh.example.yaml). It includes PTY, language, slideshow signalling, automatic local time offset, TAI bulletin URLs, a 2-second TIST lead, and the TCP queue, preroll and TAG alignment settings. Check the host timezone and HTTPS bulletin access before using it on air.
 
 ## Documentation
 

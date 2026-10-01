@@ -352,12 +352,33 @@ fn push(fib: &mut [u8; 30], used: &mut usize, fig: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::{InputSpec, SubchannelConfig};
+    use crate::config::testing::{example, reference, service};
     use crate::config::Config;
+
+    /// Move Radio One onto a named subchannel that a second service shares.
+    fn share_with_second_service(config: &mut Config, language: u8) {
+        config.services[0].components = vec![reference("audio_one")];
+        let mut two = service(0x4da5, "Radio Two", vec![reference("audio_one")]);
+        two.language = language;
+        config.services.push(two);
+        config.subchannels.insert(
+            "audio_one".into(),
+            SubchannelConfig {
+                id: Some(1),
+                kind: SubchannelKind::DabPlus,
+                bitrate: 96,
+                protection: None,
+                input: InputSpec::Sti {
+                    uri: "rtp://127.0.0.1:9000".into(),
+                },
+            },
+        );
+    }
 
     #[test]
     fn writes_three_crc_protected_fibs() {
-        let config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let config = example();
         let valid = config.validate().unwrap();
         let mut carousel = FicCarousel::new();
         let fibs = carousel
@@ -375,22 +396,8 @@ mod tests {
 
     #[test]
     fn packs_multiple_services_into_fig_zero_two() {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
-        config.services.push(crate::config::ServiceConfig {
-            uid: "radio_two".into(),
-            id: 0x4da5,
-            label: "Radio Two".into(),
-            short_label: None,
-            pty: 0,
-            language: 0,
-        });
-        config.components.push(crate::config::ComponentConfig {
-            uid: "component_two".into(),
-            service: "radio_two".into(),
-            subchannel: "audio_one".into(),
-            user_applications: Vec::new(),
-        });
+        let mut config = example();
+        share_with_second_service(&mut config, 0);
         let mut carousel = FicCarousel::new();
         let fibs = carousel
             .write(
@@ -406,8 +413,7 @@ mod tests {
 
     #[test]
     fn reconfiguration_counter_follows_ensemble_identity() {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let mut config = example();
         config.ensemble.reconfiguration_counter = Some(0x123);
         let mut carousel = FicCarousel::new();
         let fibs = carousel
@@ -422,8 +428,7 @@ mod tests {
 
     #[test]
     fn ensemble_information_opens_each_transmission_frame_only() {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let mut config = example();
         config.ensemble.reconfiguration_counter = Some(0x123);
         let valid = config.clone().validate().unwrap();
         let mut carousel = FicCarousel::new().with_reconfiguration_counter(Some(0x124));
@@ -449,23 +454,9 @@ mod tests {
 
     #[test]
     fn shared_subchannel_language_is_signalled_once() {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let mut config = example();
         config.services[0].language = 8;
-        config.services.push(crate::config::ServiceConfig {
-            uid: "radio_two".into(),
-            id: 0x4da5,
-            label: "Radio Two".into(),
-            short_label: None,
-            pty: 0,
-            language: 8,
-        });
-        config.components.push(crate::config::ComponentConfig {
-            uid: "component_two".into(),
-            service: "radio_two".into(),
-            subchannel: "audio_one".into(),
-            user_applications: Vec::new(),
-        });
+        share_with_second_service(&mut config, 8);
         let valid = config.validate().unwrap();
         let fibs = FicCarousel::new()
             .write(&valid, FrameClock::new(0, 0, 0).unwrap())
@@ -475,8 +466,7 @@ mod tests {
 
     #[test]
     fn explicit_short_label_mask_is_emitted_in_fig_one() {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let mut config = example();
         config.ensemble.label = "RND D00 - XX".into();
         config.ensemble.short_label = Some("RND D00".into());
         config.services[0].label = "105 DJ HRND-001".into();
@@ -495,11 +485,10 @@ mod tests {
 
     #[test]
     fn production_programme_metadata_rotates_through_time_slots() {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let mut config = example();
         config.services[0].pty = 15;
         config.services[0].language = 8;
-        config.components[0]
+        config.services[0].components[0]
             .user_applications
             .push(crate::config::UserApplication::Slideshow);
         let valid = config.validate().unwrap();
@@ -523,53 +512,22 @@ mod tests {
 
     #[test]
     fn twelve_service_metadata_completes_within_one_carousel_cycle() {
-        use crate::config::{
-            ComponentConfig, InputConfig, ProtectionConfig, ServiceConfig, SubchannelConfig,
-            UserApplication,
-        };
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        use crate::config::{testing::dab_plus, UserApplication};
+        let mut config = example();
         config.services.clear();
-        config.subchannels.clear();
-        config.components.clear();
-        for index in 0..12 {
-            let uid = format!("service_{index}");
-            let sub_uid = format!("sub_{index}");
-            config.services.push(ServiceConfig {
-                uid: uid.clone(),
-                id: 0x4001 + index,
-                label: format!("Station {index}"),
-                short_label: None,
-                pty: 15,
-                language: 8,
-            });
-            config.subchannels.push(SubchannelConfig {
-                uid: sub_uid.clone(),
-                id: index as u8 + 1,
-                bitrate: if index < 4 {
-                    72
-                } else if index < 8 {
-                    64
-                } else {
-                    48
-                },
-                kind: SubchannelKind::DabPlus,
-                protection: ProtectionConfig::EepA { level: 3 },
-                input: InputConfig::Edi {
-                    uri: format!("tcp://127.0.0.1:{}", 9001 + index),
-                    stream_index: 1,
-                    buffer_frames: 40,
-                    prebuffer_frames: 4,
-                    timing: crate::config::InputTiming::Prebuffering,
-                    backpressure: None,
-                },
-            });
-            config.components.push(ComponentConfig {
-                uid: format!("component_{index}"),
-                service: uid,
-                subchannel: sub_uid,
-                user_applications: vec![UserApplication::Slideshow],
-            });
+        for index in 0..12u16 {
+            let bitrate = [72, 64, 48][usize::from(index / 4)];
+            let mut component = dab_plus(bitrate, &format!("tcp://127.0.0.1:{}", 9001 + index));
+            component.subchannel_id = Some(index as u8 + 1);
+            component.user_applications = vec![UserApplication::Slideshow];
+            let mut station = service(
+                0x4001 + u32::from(index),
+                &format!("Station {index}"),
+                vec![component],
+            );
+            station.pty = 15;
+            station.language = 8;
+            config.services.push(station);
         }
         let valid = config.validate().unwrap();
         assert_eq!(
@@ -603,10 +561,8 @@ mod tests {
 #[cfg(test)]
 mod oracle_tests {
     use super::*;
-    use crate::config::{
-        ComponentConfig, Config, InputConfig, InputTiming, ProtectionConfig, ServiceConfig,
-        SubchannelConfig, UserApplication,
-    };
+    use crate::config::testing::{dab_plus, example, service};
+    use crate::config::{ProtectionConfig, UserApplication};
     use crate::testsupport::edinburgh::fic::{DateTimeUTC, FicDecoder, Fig};
     use crate::testsupport::edinburgh::tables;
     use std::collections::{HashMap, HashSet};
@@ -619,54 +575,32 @@ mod oracle_tests {
     }
 
     fn twelve_service_config() -> ValidatedConfig {
-        let mut config: Config =
-            serde_yaml::from_str(include_str!("../tests/fixtures/minimal.yaml")).unwrap();
+        let mut config = example();
         config.ensemble.label = "Grüezi Mux".into();
         config.ensemble.short_label = Some("Grüezi".into());
         config.ensemble.international_table = 1;
         config.ensemble.local_time_offset_half_hours = 2;
         config.services.clear();
-        config.subchannels.clear();
-        config.components.clear();
         for index in 0..12u8 {
             let (label, short_label) = if index == 0 {
                 ("Radio Zürich 1".to_string(), Some("Zürich".to_string()))
             } else {
                 (format!("Station {index}"), None)
             };
-            config.services.push(ServiceConfig {
-                uid: format!("service_{index}"),
-                id: 0x4001 + u32::from(index),
-                label,
-                short_label,
-                pty: 15,
-                language: 8,
-            });
-            config.subchannels.push(SubchannelConfig {
-                uid: format!("sub_{index}"),
-                id: index + 1,
-                bitrate: [72, 64, 48][usize::from(index / 4)],
-                kind: SubchannelKind::DabPlus,
-                protection: if index == 4 {
-                    ProtectionConfig::EepB { level: 2 }
-                } else {
-                    ProtectionConfig::EepA { level: 3 }
-                },
-                input: InputConfig::Edi {
-                    uri: format!("tcp://127.0.0.1:{}", 9001 + u16::from(index)),
-                    stream_index: 1,
-                    buffer_frames: 40,
-                    prebuffer_frames: 4,
-                    timing: InputTiming::Prebuffering,
-                    backpressure: None,
-                },
-            });
-            config.components.push(ComponentConfig {
-                uid: format!("component_{index}"),
-                service: format!("service_{index}"),
-                subchannel: format!("sub_{index}"),
-                user_applications: vec![UserApplication::Slideshow],
-            });
+            let mut component = dab_plus(
+                [72, 64, 48][usize::from(index / 4)],
+                &format!("tcp://127.0.0.1:{}", 9001 + u16::from(index)),
+            );
+            component.subchannel_id = Some(index + 1);
+            component.user_applications = vec![UserApplication::Slideshow];
+            if index == 4 {
+                component.protection = Some(ProtectionConfig::EepB { level: 2 });
+            }
+            let mut station = service(0x4001 + u32::from(index), &label, vec![component]);
+            station.short_label = short_label;
+            station.pty = 15;
+            station.language = 8;
+            config.services.push(station);
         }
         config.validate().unwrap()
     }
@@ -751,7 +685,7 @@ mod oracle_tests {
                     Some(usize::from(sub.bitrate)),
                 )),
                 "FIG 0/1 for {}",
-                sub.uid
+                sub.name
             );
         }
         let sids: HashSet<_> = source.services.iter().map(|s| s.id as u16).collect();

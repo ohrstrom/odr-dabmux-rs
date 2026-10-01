@@ -12,9 +12,13 @@ mod stats;
 
 async fn push_config(
     axum::extract::State(state): axum::extract::State<AppState>,
-    Json(candidate): Json<crate::config::Config>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    match state.config.apply(candidate).await {
+    let result = match crate::config::parse_json(&body) {
+        Ok(candidate) => state.config.apply(candidate).await,
+        Err(err) => Err(err),
+    };
+    match result {
         Ok(changed) => (
             StatusCode::OK,
             Json(serde_json::json!({"changed": changed})),
@@ -22,10 +26,17 @@ async fn push_config(
             .into_response(),
         Err(err) => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": err.to_string()})),
+            Json(serde_json::json!({"error": format!("{err:#}")})),
         )
             .into_response(),
     }
+}
+
+/// The active configuration with SubChIds, CU layout and defaults resolved.
+async fn resolved_config(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    Json(serde_json::to_value(state.config.read().await.resolved()).unwrap_or_default())
 }
 
 #[derive(Serialize)]
@@ -49,5 +60,6 @@ pub fn router() -> Router<AppState> {
         .route("/stats/services", get(stats::get_services))
         .route("/stats", get(stats::get_stats))
         .route("/config", post(push_config))
+        .route("/config/resolved", get(resolved_config))
         .fallback(api_404_handler)
 }

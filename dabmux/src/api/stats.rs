@@ -1,10 +1,10 @@
 use axum::{extract::State, Json};
 
 use crate::app::AppState;
-use crate::config::ServiceConfig;
+use crate::config::Service;
 use crate::runtime::StatsSnapshot;
 
-pub async fn get_services(State(state): State<AppState>) -> Json<Vec<ServiceConfig>> {
+pub async fn get_services(State(state): State<AppState>) -> Json<Vec<Service>> {
     Json(state.config.read().await.source.services.clone())
 }
 
