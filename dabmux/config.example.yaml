@@ -51,4 +51,4 @@ services:
 output:
   destinations:
     - protocol: tcp
-      listen_port: 9000
+      listen_port: 8999

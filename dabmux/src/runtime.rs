@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
@@ -760,6 +760,39 @@ fn bind_error(
     }
 }
 
+/// How long the loopback probe of [`refuse_shadowed_port`] waits.
+const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Refuse a wildcard TCP bind that another listener on 127.0.0.1 would shadow.
+/// Tokio binds with SO_REUSEADDR, and on macOS and the BSDs that lets
+/// `0.0.0.0:port` succeed while another process listens on
+/// `127.0.0.1:port`; local clients then reach that process instead of the
+/// mux. Linux rejects such a bind itself, so the probe only finds nothing.
+async fn refuse_shadowed_port(
+    address: std::net::SocketAddr,
+    what: &str,
+    held_ports: &HashSet<u16>,
+) -> Result<()> {
+    if !address.ip().is_unspecified() {
+        return Ok(());
+    }
+    let port = address.port();
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    if let Ok(Ok(_)) = time::timeout(LOOPBACK_PROBE_TIMEOUT, TcpStream::connect(loopback)).await {
+        if held_ports.contains(&port) {
+            bail!(
+                "binding {what}: port {port} is still held by the active configuration; \
+                 release it in one update and reuse it in a later one"
+            );
+        }
+        bail!(
+            "binding {what}: another process already listens on {loopback}, so local \
+             clients would reach it instead of the mux; stop it or choose another port"
+        );
+    }
+    Ok(())
+}
+
 async fn prepare_resources(
     candidate: &ValidatedConfig,
     existing_inputs: &HashSet<InputEndpoint>,
@@ -790,6 +823,10 @@ async fn prepare_resources(
             continue;
         }
         let port = endpoint.address.port();
+        if endpoint.transport == Transport::Tcp {
+            refuse_shadowed_port(endpoint.address, &format!("input {endpoint}"), &held_ports)
+                .await?;
+        }
         let socket = match endpoint.transport {
             Transport::Tcp => InputSocket::Tcp(Arc::new(
                 TcpListener::bind(endpoint.address).await.map_err(|err| {
@@ -810,7 +847,9 @@ async fn prepare_resources(
             {
                 continue;
             }
-            let listener = TcpListener::bind(("0.0.0.0", *listen_port))
+            let address = std::net::SocketAddr::from(([0, 0, 0, 0], *listen_port));
+            refuse_shadowed_port(address, "EDI TCP output", &held_ports).await?;
+            let listener = TcpListener::bind(address)
                 .await
                 .map_err(|err| bind_error(err, "EDI TCP output", *listen_port, &held_ports))?;
             prepared.outputs.insert(*listen_port, Arc::new(listener));
@@ -1779,5 +1818,41 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wildcard_bind_refuses_a_port_shadowed_on_loopback() {
+        // Another "process": a listener on 127.0.0.1 only.
+        let other = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = other.local_addr().unwrap().port();
+        let wildcard = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let err = refuse_shadowed_port(wildcard, "EDI TCP output", &HashSet::new())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("another process already listens on 127.0.0.1:"),
+            "{err}"
+        );
+        // Our own active configuration holding the port gets the reload hint.
+        let err = refuse_shadowed_port(wildcard, "EDI TCP output", &HashSet::from([port]))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("still held by the active configuration"),
+            "{err}"
+        );
+        // Specific addresses are left to bind() itself; free ports pass.
+        let specific = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        assert!(refuse_shadowed_port(specific, "input", &HashSet::new())
+            .await
+            .is_ok());
+        drop(other);
+        assert!(
+            refuse_shadowed_port(wildcard, "EDI TCP output", &HashSet::new())
+                .await
+                .is_ok()
+        );
     }
 }
