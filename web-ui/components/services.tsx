@@ -38,6 +38,7 @@ import {
   type ResolvedConfig,
   type Service,
 } from "@/lib/config"
+import { useDraft } from "@/hooks/use-draft"
 import { href } from "@/hooks/use-route"
 
 export function ServiceKind({ service }: { service: Service }) {
@@ -45,6 +46,18 @@ export function ServiceKind({ service }: { service: Service }) {
     <Badge variant="outline">data</Badge>
   ) : (
     <Badge variant="secondary">programme</Badge>
+  )
+}
+
+/** Added or edited in the pending changes. */
+function PendingBadge({ id }: { id: number }) {
+  const { changes } = useDraft()
+  const kind = changes.find((group) => group.key === `service-${id}`)?.kind
+  if (!kind) return null
+  return (
+    <Badge variant="outline" className="ml-2 text-amber-600 dark:text-amber-400">
+      {kind === "added" ? "new" : "edited"}
+    </Badge>
   )
 }
 
@@ -79,7 +92,10 @@ export function ServicesTable({ config }: { config: ResolvedConfig }) {
                 {sid(service.id)}
               </a>
             </TableCell>
-            <TableCell className="font-medium">{service.label}</TableCell>
+            <TableCell className="font-medium">
+              {service.label}
+              <PendingBadge id={service.id} />
+            </TableCell>
             <TableCell>{service.short_label ?? <None />}</TableCell>
             <TableCell>
               <ServiceKind service={service} />

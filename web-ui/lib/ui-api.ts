@@ -1,14 +1,28 @@
-// Client for /api/ui (dabmux/src/api/ui.rs): the operator configuration and
-// edits of the ensemble and of single services. Edits send the revision they
-// are based on, so the mux refuses them if the configuration changed meanwhile.
+// Client for /api/ui (dabmux/src/api/ui.rs). The UI edits a copy of the
+// operator configuration in the browser, has the mux validate it, and
+// applies it whole, together with the revision it is based on, so the mux
+// refuses it if its configuration changed meanwhile. Saving writes the
+// running configuration to the configuration file.
 
 import type {
   Ensemble,
+  ResolvedConfig,
   SubchannelType,
   UserApplication,
 } from "@/lib/config"
 
-/** A service as written in the configuration file, defaults unresolved. */
+/** The configuration as written in the configuration file, defaults unresolved. */
+export type OperatorConfig = {
+  ensemble: Ensemble
+  defaults?: Record<string, unknown>
+  subchannels?: Record<string, Record<string, unknown>>
+  services: ServiceConfig[]
+  other_services?: unknown[]
+  frequencies?: unknown[]
+  service_changes?: unknown[]
+  output: Record<string, unknown>
+}
+
 export type ServiceConfig = {
   id: number
   ecc?: number
@@ -37,12 +51,9 @@ export type ComponentConfig = {
   data_groups?: boolean
 }
 
-/** JSON Merge Patch of a service: `null` removes a field. */
-export type ServicePatch = {
-  [K in keyof ServiceConfig]?: ServiceConfig[K] | null
-}
-
 export type Applied = { changed: boolean; revision: number; warnings: string[] }
+
+export type Preview = { resolved: ResolvedConfig; warnings: string[] }
 
 export class ApiError extends Error {
   constructor(
@@ -64,10 +75,7 @@ async function request<T>(
   { body, revision }: { body?: unknown; revision?: number } = {}
 ): Promise<T> {
   const headers: Record<string, string> = {}
-  if (body !== undefined) {
-    headers["content-type"] =
-      method === "PATCH" ? "application/merge-patch+json" : "application/json"
-  }
+  if (body !== undefined) headers["content-type"] = "application/json"
   if (revision !== undefined) headers["if-match"] = `"${revision}"`
   const response = await fetch(`/api/ui${path}`, {
     method,
@@ -90,44 +98,35 @@ async function request<T>(
   return parsed as T
 }
 
-const path = (sid: string) => `/services/${encodeURIComponent(sid)}`
+/** Where the configuration file is, and whether it differs from the running one. */
+export type FileStatus = { path: string; unsaved: boolean }
 
-export function getService(sid: string) {
-  return request<{ service: ServiceConfig; revision: number }>("GET", path(sid))
+export type Saved = { path: string; backup: string; revision: number }
+
+export function getConfig() {
+  return request<{
+    config: OperatorConfig
+    revision: number
+    file: FileStatus | null
+  }>("GET", "/config")
 }
 
-export function createService(service: ServiceConfig, revision?: number) {
-  return request<Applied & { service: ServiceConfig }>("POST", "/services", {
-    body: service,
-    revision,
-  })
+/** Validate without applying. */
+export function previewConfig(config: OperatorConfig) {
+  return request<Preview>("POST", "/config/preview", { body: config })
 }
 
-export function patchService(sid: string, patch: ServicePatch, revision?: number) {
-  return request<Applied & { service: ServiceConfig }>("PATCH", path(sid), {
-    body: patch,
-    revision,
-  })
+/** Apply `config`; without `revision`, regardless of changes made meanwhile. */
+export function applyConfig(config: OperatorConfig, revision?: number) {
+  return request<Applied>("PUT", "/config", { body: config, revision })
 }
 
-export function deleteService(sid: string, revision?: number) {
-  return request<Applied & { removed_subchannels: string[] }>(
-    "DELETE",
-    path(sid),
-    { revision }
-  )
-}
-
-/** JSON Merge Patch of the ensemble settings. */
-export type EnsemblePatch = { [K in keyof Ensemble]?: Ensemble[K] | null }
-
-export function getEnsemble() {
-  return request<{ ensemble: Ensemble; revision: number }>("GET", "/ensemble")
-}
-
-export function patchEnsemble(patch: EnsemblePatch, revision?: number) {
-  return request<Applied & { ensemble: Ensemble }>("PATCH", "/ensemble", {
-    body: patch,
+/**
+ * Write the running configuration to the configuration file. Without
+ * `force`, the mux refuses when the file was changed on disk meanwhile.
+ */
+export function saveConfig(revision: number, force = false) {
+  return request<Saved>("POST", `/config/save${force ? "?force=true" : ""}`, {
     revision,
   })
 }

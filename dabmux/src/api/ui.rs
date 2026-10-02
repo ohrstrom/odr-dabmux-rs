@@ -1,7 +1,8 @@
-//! Endpoints for the web UI: the operator configuration and edits of the
-//! ensemble and of single services. Every edit changes a copy of the running configuration, which
-//! replaces it only when valid. Edits live in memory; the config file is not
-//! written.
+//! Endpoints for the web UI: the operator configuration, its preview,
+//! replacement and saving, and edits of the ensemble and of single services.
+//! Every edit changes a copy of the running configuration, which replaces it
+//! only when valid. Applied changes live in memory until the configuration
+//! is saved to the config file.
 //!
 //! Responses carry the configuration revision as `ETag`; requests may send
 //! it back as `If-Match` to refuse edits based on an outdated configuration
@@ -11,10 +12,10 @@ use std::collections::HashSet;
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::de::DeserializeOwned;
@@ -26,7 +27,9 @@ use crate::config::{service_name, Applied, Config, EditError, EnsembleConfig};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/config", get(get_config))
+        .route("/config", get(get_config).put(replace_config))
+        .route("/config/preview", post(preview_config))
+        .route("/config/save", post(save_config))
         .route(
             "/ensemble",
             get(get_ensemble)
@@ -43,9 +46,75 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+/// The running configuration and whether the configuration file holds it.
 async fn get_config(State(state): State<AppState>) -> Response {
     let source = state.config.source().await;
-    with_revision(source.number, json!({ "config": source.config }))
+    let file = state.config.file_status().await;
+    with_revision(
+        source.number,
+        json!({ "config": source.config, "file": file }),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct SaveOptions {
+    /// Overwrite the file even if it was changed on disk.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Write the running configuration to the configuration file.
+async fn save_config(
+    State(state): State<AppState>,
+    Query(options): Query<SaveOptions>,
+    headers: HeaderMap,
+) -> Response {
+    let result = async { state.config.save(if_match(&headers)?, options.force).await }.await;
+    match result {
+        Ok(saved) => Json(json!(saved)).into_response(),
+        Err(err) => error_response(err),
+    }
+}
+
+/// Replace the whole operator configuration, as the web UI does when it
+/// applies the changes collected in the browser.
+async fn replace_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let result = async {
+        let candidate: Config = parse_body(&body)?;
+        state
+            .config
+            .edit(if_match(&headers)?, |config| {
+                *config = candidate;
+                Ok(())
+            })
+            .await
+    }
+    .await;
+    match result {
+        Ok(((), applied)) => applied_response(StatusCode::OK, json!({}), applied),
+        Err(err) => error_response(err),
+    }
+}
+
+/// Validate a configuration without applying it: the resolved view as the
+/// mux would run it, and the warnings applying it would give.
+async fn preview_config(State(state): State<AppState>, body: Bytes) -> Response {
+    let result = async {
+        let candidate: Config = parse_body(&body)?;
+        let (validated, warnings) = state.config.preview(candidate).await?;
+        let resolved = serde_json::to_value(validated.resolved())
+            .map_err(|err| EditError::Rejected(err.into()))?;
+        Ok::<_, EditError>(json!({ "resolved": resolved, "warnings": warnings }))
+    }
+    .await;
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(err) => error_response(err),
+    }
 }
 
 async fn get_ensemble(State(state): State<AppState>) -> Response {

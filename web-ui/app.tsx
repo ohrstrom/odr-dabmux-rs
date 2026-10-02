@@ -30,13 +30,18 @@ import { ServiceDetail, ServicesPage } from "@/components/services"
 import { ServiceFollowingPage } from "@/components/service-following"
 import { SubchannelsPage } from "@/components/subchannels"
 import { ThemeProvider } from "@/components/theme-provider"
+import { ChangesBar } from "@/components/changes-bar"
+import { DraftProvider, useDraft } from "@/hooks/use-draft"
 import { serviceKey, type ResolvedConfig } from "@/lib/config"
 import { useResolvedConfig } from "@/hooks/use-resolved-config"
 import { href, useRoute } from "@/hooks/use-route"
 
 function App() {
   const route = useRoute()
-  const { config, error, loading, updatedAt, refresh } = useResolvedConfig()
+  const { config: running, error, loading, updatedAt, refresh } = useResolvedConfig()
+  const draft = useDraft()
+  // With pending changes, the pages show the draft as the mux would run it.
+  const config = draft.preview?.resolved ?? running
   const page: Page = route[0] && route[0] in PAGES ? (route[0] as Page) : "overview"
 
   return (
@@ -46,7 +51,7 @@ function App() {
         route={route}
         status={<ConnectionStatus error={error} updatedAt={updatedAt} />}
       />
-      <SidebarInset>
+      <SidebarInset className="min-w-0">
         <header className="sticky top-0 z-10 flex h-12 shrink-0 items-center gap-2 border-b bg-background/95 px-4 backdrop-blur">
           <SidebarTrigger className="-ml-1" />
           <Separator orientation="vertical" className="mr-2 h-4 self-center" />
@@ -87,6 +92,7 @@ function App() {
             <Loading />
           ) : null}
         </div>
+        <ChangesBar onApplied={refresh} />
       </SidebarInset>
     </SidebarProvider>
   )
@@ -103,10 +109,12 @@ function Content({
   route: string[]
   onChanged: () => void
 }) {
+  const draft = useDraft()
   switch (page) {
     case "services": {
       if (!route[1]) return <ServicesPage config={config} onChanged={onChanged} />
       const service = config.services.find((s) => serviceKey(s) === route[1])
+      if (!service && draft.validating) return <Loading />
       return service ? (
         <ServiceDetail config={config} service={service} onChanged={onChanged} />
       ) : (
@@ -222,7 +230,9 @@ createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ThemeProvider>
       <TooltipProvider>
-        <App />
+        <DraftProvider>
+          <App />
+        </DraftProvider>
         <Toaster position="bottom-right" />
       </TooltipProvider>
     </ThemeProvider>

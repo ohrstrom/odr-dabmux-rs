@@ -1,6 +1,5 @@
 import * as React from "react"
 import { WarningCircleIcon } from "@phosphor-icons/react"
-import { toast } from "sonner"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -31,16 +30,8 @@ import {
   type Subchannel,
   type SubchannelType,
 } from "@/lib/config"
-import {
-  ApiError,
-  createService,
-  getService,
-  patchService,
-  type Applied,
-  type ComponentConfig,
-  type ServiceConfig,
-  type ServicePatch,
-} from "@/lib/ui-api"
+import { useDraft } from "@/hooks/use-draft"
+import type { ComponentConfig, ServiceConfig } from "@/lib/ui-api"
 
 type InputSpec = NonNullable<ComponentConfig["input"]>
 
@@ -261,39 +252,21 @@ function newService(form: Form): ServiceConfig {
   }
 }
 
-/** Merge patch with the fields that differ from `loaded`. */
-function changes(form: Form, loaded: ServiceConfig): ServicePatch {
-  const patch: ServicePatch = {}
-  const fields = serviceFields(form)
-  for (const key of Object.keys(fields) as (keyof typeof fields)[]) {
-    const value = fields[key]
-    if (value !== loaded[key] && !(value === 0 && loaded[key] === undefined)) {
-      ;(patch as Record<string, unknown>)[key] = value ?? null
-    }
+/** `loaded` with the form's settings. */
+function edited(form: Form, loaded: ServiceConfig): ServiceConfig {
+  return {
+    ...loaded,
+    ...serviceFields(form),
+    components: loaded.components.map((component, i) =>
+      toComponent(form.components[i]!, component)
+    ),
   }
-  // Arrays are replaced whole by a merge patch, so send all components.
-  const components = loaded.components.map((component, i) =>
-    toComponent(form.components[i]!, component)
-  )
-  if (JSON.stringify(components) !== JSON.stringify(loaded.components)) {
-    patch.components = components
-  }
-  return patch
 }
 
 /** The running subchannel of component `index` of service `id`. */
 function resolvedSubchannel(config: ResolvedConfig, id: number, index: number) {
   const name = config.services.find((s) => s.id === id)?.components[index]?.subchannel
   return config.subchannels.find((s) => s.name === name)
-}
-
-export function announce(applied: Applied, message: string) {
-  toast.success(message, {
-    description: applied.changed
-      ? `Revision ${applied.revision} is on air.`
-      : "The running multiplex did not change.",
-  })
-  for (const warning of applied.warnings) toast.warning(warning)
 }
 
 /** Create a service (`sid` unset) or edit one. */
@@ -311,39 +284,29 @@ export function ServiceFormDialog({
   onSaved: (service: ServiceConfig) => void
 }) {
   const creating = editing === undefined
+  const draft = useDraft()
   const [form, setForm] = React.useState<Form>(EMPTY)
-  const [loaded, setLoaded] = React.useState<{
-    service: ServiceConfig
-    revision: number
-  } | null>(null)
+  const [loaded, setLoaded] = React.useState<ServiceConfig | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [submitted, setSubmitted] = React.useState(false)
-  const [saving, setSaving] = React.useState(false)
 
-  /** Load the current service; `notice` stays shown above the form. */
-  const load = React.useCallback(
-    async (notice: string | null = null) => {
-      setError(notice)
-      setSubmitted(false)
-      setLoaded(null)
-      if (creating) {
-        setForm(EMPTY)
-        return
-      }
-      try {
-        const result = await getService(editing)
-        setLoaded(result)
-        setForm(toForm(result.service))
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
-      }
-    },
-    [creating, editing]
-  )
-
+  // Fill the form from the draft when the dialog opens.
   React.useEffect(() => {
-    if (open) load()
-  }, [open, load])
+    if (!open) return
+    setError(null)
+    setSubmitted(false)
+    if (creating) {
+      setLoaded(null)
+      setForm(EMPTY)
+      return
+    }
+    const service = draft.current?.services.find((s) => sid(s.id) === editing)
+    setLoaded(service ?? null)
+    if (service) setForm(toForm(service))
+    else setError(`No service ${editing}`)
+    // Only on opening: later draft changes must not reset the form.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, creating, editing])
 
   const set = <K extends keyof Form>(key: K, value: Form[K]) =>
     setForm((f) => ({ ...f, [key]: value }))
@@ -356,39 +319,30 @@ export function ServiceFormDialog({
   const errors = submitted ? check(form) : {}
   const data = (parseHex(form.id) ?? 0) > 0xffff
 
-  async function submit(event: React.FormEvent) {
+  function submit(event: React.FormEvent) {
     event.preventDefault()
     setSubmitted(true)
-    if (Object.keys(check(form)).length) return
-    setSaving(true)
-    setError(null)
-    try {
-      if (creating) {
-        const result = await createService(newService(form))
-        announce(result, `${result.service.label} added`)
-        onSaved(result.service)
-      } else if (loaded) {
-        const patch = changes(form, loaded.service)
-        if (Object.keys(patch).length === 0) {
-          onOpenChange(false)
-          return
-        }
-        const result = await patchService(editing!, patch, loaded.revision)
-        announce(result, `${result.service.label} saved`)
-        onSaved(result.service)
-      }
-      onOpenChange(false)
-    } catch (e) {
-      if (e instanceof ApiError && e.stale) {
-        await load(
-          `${e.message}. Someone else changed the configuration; the form now shows the current values, so your changes need to be made again.`
-        )
-        return
-      }
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
+    const found = check(form)
+    const id = parseHex(form.id)
+    const taken = draft.current?.services.some(
+      (s) => s.id === id && (creating || s.id !== loaded?.id)
+    )
+    if (taken) {
+      setError(`Service ${form.id} exists already`)
+      return
     }
+    if (Object.keys(found).length) return
+    const service = creating ? newService(form) : edited(form, loaded!)
+    draft.update((config) => {
+      if (creating) {
+        config.services.push(service)
+      } else {
+        const index = config.services.findIndex((s) => s.id === loaded!.id)
+        config.services[index] = service
+      }
+    })
+    onSaved(service)
+    onOpenChange(false)
   }
 
   const ready = creating || loaded !== null
@@ -399,12 +353,12 @@ export function ServiceFormDialog({
         <form onSubmit={submit} className="grid gap-4" noValidate>
           <DialogHeader>
             <DialogTitle>
-              {creating ? "Add service" : `Edit ${loaded?.service.label ?? "service"}`}
+              {creating ? "Add service" : `Edit ${loaded?.label ?? "service"}`}
             </DialogTitle>
             <DialogDescription>
               {creating
-                ? "The service is appended, so existing SubChIds stay as they are."
-                : "Changing a bitrate or protection moves the subchannels after it in the MSC."}
+                ? "The service is appended, so existing SubChIds stay as they are. It goes on air when the changes are applied."
+                : "Changes collect until they are applied. A new bitrate or protection moves the subchannels after it in the MSC."}
             </DialogDescription>
           </DialogHeader>
 
@@ -473,7 +427,7 @@ export function ServiceFormDialog({
 
               {form.components.map((component, i) => {
                 const resolved = loaded
-                  ? resolvedSubchannel(config, loaded.service.id, i)
+                  ? resolvedSubchannel(config, loaded.id, i)
                   : undefined
                 return (
                   <ComponentFields
@@ -502,8 +456,8 @@ export function ServiceFormDialog({
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={!ready || saving}>
-              {saving ? "Saving…" : creating ? "Add service" : "Save"}
+            <Button type="submit" disabled={!ready}>
+              {creating ? "Add service" : "Done"}
             </Button>
           </DialogFooter>
         </form>

@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 pub mod linking;
 mod number;
+pub mod persist;
 pub mod reload;
 pub mod schema;
 pub mod watch;
@@ -29,6 +30,34 @@ pub struct SharedConfig {
     source: Arc<RwLock<Revision>>,
     updates: Arc<Mutex<Option<mpsc::Sender<ConfigUpdate>>>>,
     update_lock: Arc<Mutex<()>>,
+    /// The configuration file, when the configuration came from one.
+    file: Arc<Mutex<Option<ConfigFile>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ConfigFile {
+    path: PathBuf,
+    /// The text as last read or written by the mux.
+    text: String,
+    /// The configuration in `text`, unless it is invalid.
+    config: Option<Config>,
+}
+
+/// Whether the running configuration is the one in the configuration file.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileStatus {
+    pub path: PathBuf,
+    /// The running configuration differs from the file.
+    pub unsaved: bool,
+}
+
+/// The outcome of writing the configuration file.
+#[derive(Debug, Clone, Serialize)]
+pub struct Saved {
+    pub path: PathBuf,
+    /// The previous file, with its comments.
+    pub backup: PathBuf,
+    pub revision: u64,
 }
 
 /// An operator configuration and its revision, which counts accepted
@@ -88,7 +117,87 @@ impl SharedConfig {
             })),
             updates: Arc::new(Mutex::new(None)),
             update_lock: Arc::new(Mutex::new(())),
+            file: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Note that the configuration was read from `path`, which held `text`.
+    pub fn with_file(self, path: PathBuf, text: String) -> Self {
+        let config = parse_yaml(&text).ok();
+        *self.file.try_lock().expect("not shared yet") = Some(ConfigFile { path, text, config });
+        self
+    }
+
+    /// Read the configuration file again and apply it.
+    pub async fn reload_file(&self, path: &Path) -> anyhow::Result<Applied> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let parsed = parse_yaml(&text);
+        if let Some(file) = self
+            .file
+            .lock()
+            .await
+            .as_mut()
+            .filter(|file| file.path == path)
+        {
+            file.text = text;
+            file.config = parsed.as_ref().ok().cloned();
+        }
+        let config =
+            parsed.with_context(|| format!("failed to parse config {}", path.display()))?;
+        self.apply(config).await
+    }
+
+    pub async fn file_status(&self) -> Option<FileStatus> {
+        let source = self.source.read().await;
+        self.file.lock().await.as_ref().map(|file| FileStatus {
+            path: file.path.clone(),
+            unsaved: file.config.as_ref() != Some(&source.config),
+        })
+    }
+
+    /// Write the running configuration to the configuration file. Unless
+    /// `force` is set, this is refused when the file changed on disk since
+    /// the mux read or wrote it, so that edits made there are not lost.
+    pub async fn save(&self, revision: Option<u64>, force: bool) -> Result<Saved, EditError> {
+        let _guard = self.update_lock.lock().await;
+        let source = self.source().await;
+        if let Some(expected) = revision.filter(|expected| *expected != source.number) {
+            return Err(EditError::Stale(format!(
+                "configuration changed since revision {expected}; it is at revision {} now",
+                source.number
+            )));
+        }
+        let mut file = self.file.lock().await;
+        let file = file.as_mut().ok_or_else(|| {
+            EditError::Conflict("the configuration was not read from a file".into())
+        })?;
+        let on_disk = std::fs::read_to_string(&file.path).unwrap_or_default();
+        if on_disk != file.text && !force {
+            return Err(EditError::Conflict(format!(
+                "{} changed on disk since the mux read it; saving would discard those changes",
+                file.path.display()
+            )));
+        }
+        let name = file
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let text = format!(
+            "# Written by dabmux on {}. Comments are not kept; the previous\n# file, with its comments, is {name}.bak.\n\n{}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+            persist::to_yaml(&source.config)?
+        );
+        let backup = persist::write_file(&file.path, &text)?;
+        file.text = text;
+        file.config = Some(source.config);
+        Ok(Saved {
+            path: file.path.clone(),
+            backup,
+            revision: source.number,
+        })
     }
 
     pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, ValidatedConfig> {
@@ -136,22 +245,33 @@ impl SharedConfig {
         Ok((value, self.apply_locked(candidate).await?))
     }
 
+    /// Validate `candidate` without applying it, with the warnings applying
+    /// it would give.
+    pub async fn preview(
+        &self,
+        candidate: Config,
+    ) -> anyhow::Result<(ValidatedConfig, Vec<String>)> {
+        let validated = candidate.validate()?;
+        let warnings = self.warnings(&validated).await;
+        Ok((validated, warnings))
+    }
+
+    /// Warnings for replacing the active configuration with `validated`.
+    async fn warnings(&self, validated: &ValidatedConfig) -> Vec<String> {
+        let mut warnings = validated.warnings();
+        let active = self.active.read().await;
+        warnings.extend(validated.reallocated_subchannels(&active).into_iter().map(
+            |(name, from, to)| {
+                format!("{name}: allocated SubChId changes from {from} to {to}; receivers lose the service until they rescan")
+            },
+        ));
+        warnings
+    }
+
     async fn apply_locked(&self, candidate: Config) -> anyhow::Result<Applied> {
         let validated = candidate.clone().validate()?;
-        let mut warnings = validated.warnings();
-        let changed = {
-            let active = self.active.read().await;
-            if *active == validated {
-                false
-            } else {
-                warnings.extend(validated.reallocated_subchannels(&active).into_iter().map(
-                    |(name, from, to)| {
-                        format!("{name}: allocated SubChId changes from {from} to {to}; receivers lose the service until they rescan")
-                    },
-                ));
-                true
-            }
-        };
+        let warnings = self.warnings(&validated).await;
+        let changed = *self.active.read().await != validated;
         if changed {
             self.send_to_runtime(validated).await?;
         }
@@ -1039,6 +1159,7 @@ pub fn short_label_mask(path: &str, label: &str, short_label: Option<&str>) -> a
     bail!("{path} must be a character subsequence of the full label")
 }
 
+#[cfg(test)]
 /// Read the operator configuration of `path`, without validating it.
 pub fn read_file(path: &Path) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
@@ -1046,13 +1167,18 @@ pub fn read_file(path: &Path) -> anyhow::Result<Config> {
     parse_yaml(&raw).with_context(|| format!("failed to parse config {}", path.display()))
 }
 
-pub fn load_from_file(path: &Path) -> anyhow::Result<(Config, ValidatedConfig)> {
-    let source = read_file(path)?;
+/// The configuration file: its text, the configuration in it, and that
+/// configuration validated.
+pub fn load_from_file(path: &Path) -> anyhow::Result<(String, Config, ValidatedConfig)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let source =
+        parse_yaml(&text).with_context(|| format!("failed to parse config {}", path.display()))?;
     let validated = source
         .clone()
         .validate()
         .with_context(|| format!("invalid config {}", path.display()))?;
-    Ok((source, validated))
+    Ok((text, source, validated))
 }
 
 /// Parse YAML config; errors name the offending field, e.g.
@@ -2053,5 +2179,48 @@ output:
 
         let (_, unchanged) = shared.edit(Some(2), |_| Ok(())).await.unwrap();
         assert_eq!((unchanged.changed, unchanged.revision), (false, 2));
+    }
+
+    #[tokio::test]
+    async fn saving_writes_the_running_configuration_and_keeps_a_backup() {
+        let dir = std::env::temp_dir().join(format!("dabmux-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mux.yaml");
+        let original = format!(
+            "# hand-written\n{}",
+            include_str!("../tests/fixtures/minimal.yaml")
+        );
+        std::fs::write(&path, &original).unwrap();
+        let shared = SharedConfig::new(example(), example().validate().unwrap())
+            .with_file(path.clone(), original.clone());
+        accepting_runtime(&shared).await;
+        assert!(!shared.file_status().await.unwrap().unsaved);
+
+        shared
+            .edit(None, |config| {
+                config.services[0].label = "Saved".into();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(shared.file_status().await.unwrap().unsaved);
+
+        let saved = shared.save(Some(2), false).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&saved.backup).unwrap(), original);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with("# Written by dabmux"));
+        assert_eq!(parse_yaml(&written).unwrap().services[0].label, "Saved");
+        assert!(!shared.file_status().await.unwrap().unsaved);
+
+        std::fs::write(&path, "# edited by hand\n").unwrap();
+        assert!(matches!(
+            shared.save(None, false).await,
+            Err(EditError::Conflict(_))
+        ));
+        shared.save(None, true).await.unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("label: Saved"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

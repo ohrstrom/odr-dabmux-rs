@@ -1,4 +1,4 @@
-# Written by dabmux on 2026-10-02 18:05:16 UTC. Comments are not kept; the previous
+# Written by dabmux on 2026-10-02 18:04:40 UTC. Comments are not kept; the previous
 # file, with its comments, is config.web-ui.example.yaml.bak.
 
 ensemble:
@@ -21,7 +21,7 @@ services:
   label: Program 1
   short_label: P1
   pty: 0
-  language: 5
+  language: 0
   components:
   - subchannel_id: 1
     type: dab_plus

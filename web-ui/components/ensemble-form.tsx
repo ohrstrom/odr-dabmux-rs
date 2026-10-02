@@ -27,14 +27,8 @@ import {
   TextField,
   parseHex,
 } from "@/components/form-fields"
-import { announce } from "@/components/service-form"
 import { hex, localTimeOffset, type Ensemble } from "@/lib/config"
-import {
-  ApiError,
-  getEnsemble,
-  patchEnsemble,
-  type EnsemblePatch,
-} from "@/lib/ui-api"
+import { useDraft } from "@/hooks/use-draft"
 
 type Form = {
   label: string
@@ -156,18 +150,6 @@ function toEnsemble(form: Form): Ensemble {
   }
 }
 
-/** Merge patch with the settings that differ from `loaded`. */
-function changes(form: Form, loaded: Ensemble): EnsemblePatch {
-  const next = toEnsemble(form)
-  const patch: Record<string, unknown> = {}
-  for (const key of Object.keys(next) as (keyof Ensemble)[]) {
-    if (JSON.stringify(next[key]) !== JSON.stringify(loaded[key])) {
-      patch[key] = next[key]
-    }
-  }
-  return patch as EnsemblePatch
-}
-
 export function EnsembleFormDialog({
   open,
   onOpenChange,
@@ -177,72 +159,42 @@ export function EnsembleFormDialog({
   onOpenChange: (open: boolean) => void
   onSaved: () => void
 }) {
-  const [loaded, setLoaded] = React.useState<{
-    ensemble: Ensemble
-    revision: number
-  } | null>(null)
+  const draft = useDraft()
+  const loaded = draft.current?.ensemble ?? null
   const [form, setForm] = React.useState<Form | null>(null)
-  const [error, setError] = React.useState<string | null>(null)
   const [submitted, setSubmitted] = React.useState(false)
-  const [saving, setSaving] = React.useState(false)
 
-  /** Load the current settings; `notice` stays shown above the form. */
-  const load = React.useCallback(async (notice: string | null = null) => {
-    setError(notice)
-    setSubmitted(false)
-    setLoaded(null)
-    try {
-      const result = await getEnsemble()
-      setLoaded(result)
-      setForm(toForm(result.ensemble))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [])
-
+  // Fill the form from the draft when the dialog opens.
   React.useEffect(() => {
-    if (open) load()
-  }, [open, load])
+    if (!open) return
+    setSubmitted(false)
+    setForm(loaded ? toForm(loaded) : null)
+    // Only on opening: later draft changes must not reset the form.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
 
   const set = <K extends keyof Form>(key: K, value: Form[K]) =>
     setForm((f) => (f ? { ...f, [key]: value } : f))
 
   const errors = submitted && form ? check(form) : {}
 
-  async function submit(event: React.FormEvent) {
+  function submit(event: React.FormEvent) {
     event.preventDefault()
     if (!form || !loaded) return
     setSubmitted(true)
     if (Object.keys(check(form)).length) return
-    const patch = changes(form, loaded.ensemble)
-    if (Object.keys(patch).length === 0) {
-      onOpenChange(false)
-      return
-    }
-    setSaving(true)
-    setError(null)
-    try {
-      const result = await patchEnsemble(patch, loaded.revision)
-      announce(result, `${result.ensemble.label} saved`)
-      onSaved()
-      onOpenChange(false)
-    } catch (e) {
-      if (e instanceof ApiError && e.stale) {
-        await load(
-          `${e.message}. Someone else changed the configuration; the form now shows the current values, so your changes need to be made again.`
-        )
-        return
-      }
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
+    const ensemble = toEnsemble(form)
+    draft.update((config) => {
+      config.ensemble = ensemble
+    })
+    onSaved()
+    onOpenChange(false)
   }
 
   const identityChanged =
     form && loaded
-      ? parseHex(form.id) !== loaded.ensemble.id ||
-        Number(form.mode) !== loaded.ensemble.mode
+      ? parseHex(form.id) !== loaded.id ||
+        Number(form.mode) !== loaded.mode
       : false
 
   return (
@@ -252,19 +204,13 @@ export function EnsembleFormDialog({
           <DialogHeader>
             <DialogTitle>Edit ensemble</DialogTitle>
             <DialogDescription>
-              Changes go on air at the next transmission frame.
+              Changes collect until they are applied, then go on air at the
+              next transmission frame.
             </DialogDescription>
           </DialogHeader>
 
-          {error && (
-            <Alert variant="destructive">
-              <WarningCircleIcon />
-              <AlertDescription>{error}</AlertDescription>
-            </Alert>
-          )}
-
           {!form || !loaded ? (
-            !error && <Skeleton className="h-96" />
+            <Skeleton className="h-96" />
           ) : (
             <FieldGroup>
               <FieldSet>
@@ -393,8 +339,8 @@ export function EnsembleFormDialog({
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={!form || !loaded || saving}>
-              {saving ? "Saving…" : "Save"}
+            <Button type="submit" disabled={!form || !loaded}>
+              Done
             </Button>
           </DialogFooter>
         </form>
