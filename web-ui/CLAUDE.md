@@ -9,7 +9,9 @@ Keep this frontend deliberately minimal.
   additional architectural layers without a concrete need.
 - The backend is the Rust application. Do not add a Bun/Node application
   server.
-- Use relative `/api/...` URLs for backend communication.
+- Use relative `/api/...` URLs for backend communication. In development,
+  `dev.ts` serves the UI and forwards `/api/*` to the mux (`DABMUX_API`,
+  default `http://127.0.0.1:7777`); it is dev tooling, not an app server.
 - Prefer native `fetch` and plain React. Do not add Axios, state-management
   libraries, or data-fetching frameworks unless their complexity is actually
   needed.
@@ -23,7 +25,7 @@ Keep this frontend deliberately minimal.
 ## Commands
 
 ```sh
-bun ./index.html
+bun run dev                     # bun --hot ./dev.ts, port 3000 (PORT=…)
 bunx shadcn@latest add <component>
-bun build ./index.html --outdir=dist --minify
+bun run build                   # build.ts: dist/, Tailwind processed
 ```

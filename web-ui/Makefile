@@ -12,8 +12,8 @@ fmt:
 
 .PHONY: dev
 dev:
-	bun ./index.html
+	bun --hot ./dev.ts
 
 .PHONY: build
 build:
-	bun build ./index.html --outdir=dist --minify
+	bun ./build.ts
