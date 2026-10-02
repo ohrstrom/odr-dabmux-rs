@@ -1,0 +1,76 @@
+general {
+    dabmode 1
+    nbframes 400
+    syslog false
+    tist false
+    managementport 0
+}
+remotecontrol {
+    telnetport 0
+}
+ensemble {
+    id 0x4401
+    ecc 0xE1
+    local-time-offset 2
+    international-table 1
+    label "DIG D04 - ZH"
+    shortlabel "DIG D04"
+}
+services {
+    srv-bollerwage {
+        id 0x1498
+        ecc 0xE0
+        label "BOLLERWAGEN"
+        shortlabel "BOLLER"
+        pty 10
+        language 0x08
+    }
+    srv-spi {
+        id 0x44010001
+        label "DIG_SPI"
+        shortlabel "DIG_SPI"
+    }
+}
+subchannels {
+    sub-bollerwage {
+        type dabplus
+        id 10
+        bitrate 72
+        protection-profile EEP_A
+        protection 3
+        inputproto file
+        inputuri "audio.dabp"
+    }
+    sub-spi {
+        inputproto file
+        inputuri "spi-head.bin"
+        load_entire_file true
+        type enhancedpacket
+        bitrate 8
+        id 30
+        protection-profile EEP_A
+        protection 3
+    }
+}
+components {
+    comp-bollerwage {
+        service srv-bollerwage
+        subchannel sub-bollerwage
+        user-applications {
+            userapp "slideshow"
+        }
+    }
+    comp-spi {
+        service srv-spi
+        subchannel sub-spi
+        type 60
+        address 0x1
+        datagroup true
+        user-applications {
+             userapp "spi"
+        }
+    }
+}
+outputs {
+    file "file://out.eti?type=raw"
+}

@@ -1,0 +1,100 @@
+# Rust counterpart of docs/reference-configs/misc/service-linking.conf:
+# service linking (FIG 0/6), OE services (FIG 0/24), frequency information
+# (FIG 0/21) and announced service changes (FIG 0/20).
+# Flags that EN 300 401 and TS 103 176 define from content are derived:
+# the ILS flag of linkage sets, P/D from the service ID, and OE for DAB
+# frequency information. Changes on reload send CEIs automatically.
+
+ensemble:
+  id: 0x4fff
+  ecc: 0xec
+  label: OpenDigitalRadio
+  short_label: ODR
+  local_time_offset_auto: true
+
+services:
+  - id: 0x8daa
+    label: Funk
+    # Other ensembles that also carry this service (FIG 0/24, OE = 0).
+    other_ensembles: [0x4ffe, 0x4ffd, 0x4fff]
+    # Linkage sets with this service as key service (FIG 0/6).
+    linking:
+      - lsn: 0xabc
+        hard: true
+        active: true
+        links:
+          - {type: dab, id: 0x8daf}  # on another ensemble
+          - {type: fm, id: 0x1a2b}   # RDS PI code
+    components:
+      - type: dab_plus
+        subchannel_id: 1
+        bitrate: 96
+        input: {protocol: edi, uri: "tcp://:9000"}
+
+  - id: 0x8dab
+    label: Rick
+    linking:
+      # DRM, AMSS and an FM service with another ECC make this an
+      # international linkage set (ILS = 1), so ECCs travel with the ids.
+      - lsn: 0xdef
+        hard: false
+        links:
+          - {type: drm, id: 0xec1298}  # 24-bit DRM service identifier
+          - {type: amss, id: 0xea1a2b}
+          - {type: fm, id: 0x4c5d, ecc: 0x4f}
+    components:
+      - type: dab_plus
+        subchannel_id: 2
+        bitrate: 96
+        input: {protocol: edi, uri: "tcp://:9001"}
+
+# Services only in other ensembles (FIG 0/24, OE = 1).
+other_services:
+  - {id: 0x8daf, ensembles: [0x4ffd]}
+
+# Frequency information (FIG 0/21), in MHz. DAB entries for this ensemble
+# have OE = 0. FM, DRM and AMSS entries have OE = 0 when they carry a service
+# of this ensemble (its SId as PI code, or a linked id); set other_ensemble to
+# override, as for the arbitrary ids of this example.
+frequencies:
+  - type: dab
+    eid: 0x4fff
+    continuity: true
+    frequencies:
+      - {mhz: 234.208, adjacent: true, mode_i: true}
+      - {mhz: 188.928, adjacent: true, mode_i: true}
+      - {mhz: 230.784, mode_i: true}
+  - type: fm
+    pi: 0x1234
+    other_ensemble: false
+    continuity: true
+    frequencies: [87.6, 105.2]
+  - type: dab
+    eid: 0x4fee
+    continuity: true
+    frequencies:
+      - {mhz: 230.784, mode_i: true}
+  - type: drm
+    id: 0x12ab45
+    other_ensemble: false
+    continuity: true
+    frequencies: [15.21, 22.4]
+  - type: amss
+    id: 0x33cc88
+    other_ensemble: false
+    continuity: true
+    frequencies: [14.8]
+
+# Advance information about service changes (FIG 0/20). Remove an entry once
+# its change is complete. `at` (UTC, at most 28 days ahead) is optional.
+service_changes:
+  - {id: 0x1234, change: addition}
+  - {id: 0x5678, change: global_removal}
+  - {id: 0xabcd, change: identity, transfer_sid: 0xef01}
+  - {id: 0x1111, change: identity, transfer_sid: 0x2222, transfer_eid: 0x3333}
+  - {id: 0x1234, change: identity, transfer_sid: 0xc012}
+  - {id: 0x4444, change: addition, part_time: true, ascty: 0}
+
+output:
+  destinations:
+    - {protocol: tcp, listen_port: 9010}

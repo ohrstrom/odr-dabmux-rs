@@ -144,7 +144,7 @@ For an enhanced packet component, for example SPI:
 
 ```yaml
 services:
-  - id: 0x44010001
+  - id: 0xe1401001
     label: SPI
 
     components:
@@ -153,11 +153,106 @@ services:
         input:
           protocol: file
           path: /var/lib/dabmux-rs/spi.bin
+        packet_address: 1
+        user_applications:
+          - spi
 ```
 
-Packet mode, the file input and the data service fields (32-bit service IDs, packet address, DSCTy, data groups) are not implemented yet; this example shows the intended shape.
+`enhanced_packet` is packet mode with the Reed-Solomon FEC of EN 300 401 clause 5.3.5. Since V2.2.1 the standard requires that FEC for every packet mode sub-channel, so there is no plain packet type.
+
+---
+
+## Data services and packet mode
+
+A service whose primary component is in packet mode is a data service. Its ID is the 32-bit form: ECC (8 bits), country (4 bits) and service reference (20 bits). The ECC is part of the ID, so data services take no `ecc`; the mux warns when it differs from the ensemble ECC. Data services have no `pty` or `language`, and carry no audio components.
+
+Packet mode settings belong to the component, because one packet sub-channel can carry several components:
+
+- `packet_address` (required): the address of this component's packets, 1 to 1023 except 1022, which the FEC packets use. The packets come ready-made from an encoder, so the address must match theirs; the mux warns when the file contains other addresses.
+- `dscty`: the data service component type (TS 101 756 table 2b). It defaults to MOT (60) for `spi` and `slideshow` and is required otherwise.
+- `data_groups`: whether MSC data groups are used. Defaults to `true`, as MOT requires.
+
+`user_applications: [spi]` signals the SPI basic profile (TS 102 371). `spi` is accepted in packet mode only; `slideshow` works in both.
+
+A programme service may also carry a packet mode component as a secondary component.
+
+### File input
+
+```yaml
+input:
+  protocol: file
+  path: /var/lib/dabmux-rs/spi.bin
+```
+
+The file holds complete packets, as written by an SPI or MOT packet encoder. The mux reads it whole, checks every packet's length and CRC, and repeats it. A changed file takes over when the current one wraps, so no data group is cut; a damaged file keeps the previous content; a missing file sends padding packets after the current pass. A relative path is resolved against the working directory. Packet sub-channels take file inputs only, and file inputs feed packet sub-channels only.
+
+### Other countries
+
+A programme service from another country sets its ECC, which the mux signals in the FIG 0/9 extended field:
+
+```yaml
+  - id: 0x1498
+    ecc: 0xe0
+    label: BOLLERWAGEN
+```
 
 The configuration therefore describes the service in terms of its components; the top-level `subchannels` map exists only for subchannels shared between components.
+
+---
+
+## Service following
+
+Service following tells receivers where else a service can be heard. It is configured per service where the service is the subject, and at the top level otherwise. [config.service-linking.example.yaml](../../dabmux/config.service-linking.example.yaml) shows every option.
+
+```yaml
+services:
+  - id: 0x8daa
+    label: Funk
+    other_ensembles: [0x4ffe, 0x4ffd]   # FIG 0/24: also carried there
+    linking:                            # FIG 0/6: this service is the key service
+      - lsn: 0xabc
+        hard: true                      # default true; false: related content
+        active: true                    # default true
+        links:
+          - {type: dab, id: 0x8daf}
+          - {type: fm, id: 0x1a2b}
+          - {type: fm, id: 0x4c5d, ecc: 0x4f, preference: low}
+          - {type: drm, id: 0xec1298}   # 24-bit DRM or AMSS identifier
+
+other_services:                         # FIG 0/24 for services not carried here
+  - {id: 0x8daf, ensembles: [0x4ffd]}
+
+frequencies:                            # FIG 0/21, in MHz
+  - type: dab
+    eid: 0x4fff
+    continuity: true
+    frequencies:
+      - {mhz: 234.208, adjacent: true, mode_i: true}
+  - {type: fm, pi: 0x1234, frequencies: [87.6, 105.2]}
+  - {type: drm, id: 0x12ab45, frequencies: [15.21]}
+  - {type: amss, id: 0x33cc88, frequencies: [14.8]}
+
+service_changes:                        # FIG 0/20
+  - {id: 0x1234, change: addition, ascty: 63, at: 2026-11-01T13:00:00Z, label: Neu}
+  - {id: 0xabcd, change: identity, transfer_sid: 0xef01}
+```
+
+**Derived values.** The mux derives the following from content rather than taking them as settings:
+- **ILS flag:** a linkage set is international when it has DRM or AMSS links, or an identifier with another country's ECC. `international: true` forces it, and `false` is rejected when the content needs it.
+- **Identifier order:** the key service first, then DAB services carried here, other DAB, RDS, then DRM/AMSS, with normal preference before low (TS 103 176 clause 5.2.3).
+- **P/D flag:** in FIG 0/6, 0/20 and 0/24 it follows the service: a service carried here by its type, any other service by its ID width.
+- **OE flag:** for DAB frequency information it is set unless `eid` is this ensemble. For FM, DRM and AMSS it is clear when the identifier belongs to a service here (its SId as PI code, or a linked ID). `other_ensemble` overrides it.
+
+**Rules.**
+- **LSN:** 1 to 0xFFF, and unique with the hard and international flags.
+- **Active sets:** a service may have one active hard and one active soft linkage set.
+- **Dead link:** a hard set without links stops service following to FM.
+- **Data services:** they link to DAB (32-bit) and DRM identifiers only.
+- **Continuity:** for FM, DRM and AMSS it is valid only with OE = 0.
+- **Frequency steps:** DAB frequencies are multiples of 16 kHz, and FM frequencies 87.6 to 107.9 MHz in 100 kHz steps.
+- **FIG 0/20:** `change` is `identity`, `addition`, `local_removal` or `global_removal`. A `label` is allowed only for a service not carried here, and it is then signalled with the change. Remove an entry once its change is complete.
+
+**Changes.** A reload that changes or removes a linkage set, FI entry or OE entry sends its CEI for five seconds and withholds the new definition until then. A linkage set whose `active` alone changes gets the short-form activation state instead, deactivations first (TS 103 176 clauses 5.2.4 to 5.4.4).
 
 ---
 
@@ -420,7 +515,7 @@ services:
         user_applications:
           - slideshow
 
-  - id: 0x44010001
+  - id: 0xe1401001
     label: SPI
     short_label: SPI
 
@@ -433,6 +528,9 @@ services:
         input:
           protocol: file
           path: /var/lib/dabmux-rs/spi.bin
+        packet_address: 1
+        user_applications:
+          - spi
 
 output:
   tagpacket_alignment: 16
@@ -473,7 +571,8 @@ Config
 │       ├── bitrate
 │       ├── protection
 │       ├── input
-│       └── user applications
+│       ├── user applications
+│       └── packet address, DSCTy, data groups (packet mode)
 │
 └── Output
 ```

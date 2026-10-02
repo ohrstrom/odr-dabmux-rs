@@ -1,6 +1,4 @@
-# Rust counterpart of docs/reference-configs/mux-zh/mux.conf (audio services).
-# Not yet covered: the SPI data service (srv-spi, enhanced packet subchannel 30
-# fed from spi.bin), the per-service ECC 0xE0 of BOLLERWAGEN (0x1498), and the
+# Rust counterpart of docs/reference-configs/mux-zh/mux.conf. Not covered: the
 # ZeroMQ output on tcp://*:8950. SubChIds are configured explicitly so that
 # receivers keep their services across configuration changes.
 
@@ -133,6 +131,7 @@ services:
         user_applications: [slideshow]
 
   - id: 0x1498
+    ecc: 0xe0
     label: BOLLERWAGEN
     short_label: BOLLER
     pty: 10
@@ -226,6 +225,20 @@ services:
         bitrate: 48
         input: {protocol: edi, uri: "tcp://:9094"}
         user_applications: [slideshow]
+
+  # SPI data service. Its 32-bit id is copied from mux.conf: the top byte is
+  # the ECC (0x44 here, not the ensemble's 0xE1), so check it with the operator.
+  - id: 0x44010001
+    label: DIG_SPI
+    short_label: DIG_SPI
+    components:
+      - type: enhanced_packet
+        subchannel_id: 30
+        bitrate: 8
+        # Packets from an SPI encoder, addressed 1; on air: /home/odr/spi.bin.
+        input: {protocol: file, path: ../docs/reference-configs/mux-zh/spi.bin}
+        packet_address: 1
+        user_applications: [spi]
 
 output:
   tagpacket_alignment: 16

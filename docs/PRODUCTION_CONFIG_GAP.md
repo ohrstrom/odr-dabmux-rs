@@ -14,7 +14,7 @@ Compared on 2026-09-30 against the supplied `he2-mux` INFO configuration, `__ref
 | Service `language 0x08` | Implemented | YAML `services[].language`; FIG 0/5. DABlin decoded German on all 12 subchannels. |
 | Twelve DAB+ EDI/TCP inputs, EEP-A level 3, subchannel IDs and bitrates | Implemented | Each service's component: `type: dab_plus`, `subchannel_id`, `bitrate`, `input: {protocol: edi, uri: tcp://...}`; EEP 3-A is the default protection (`defaults.protection` or per-component `protection`). The supplied 4×72 + 4×64 + 4×48 kbit/s arrangement uses 552 of 864 CUs. TCP inputs throttle their encoder by default (`backpressure`); a newer producer connection replaces the previous one, and a producer silent for 10 s is disconnected. |
 | Service-to-subchannel components | Implemented | YAML `services[].components[]`; each component defines its own subchannel, so no service/component/subchannel uids are wired by hand. FIG 0/2 identifies the audio components. |
-| `user-applications { userapp "slideshow" }` on every component | Implemented | YAML `services[].components[].user_applications: [slideshow]`; FIG 0/13 signals application type `0x2`, X-PAD application type `12` and MOT DSCTy `60`. DABlin decoded Slideshow on the 12-service test stream. Each service has a single component; Rust accepts user applications only on a service's first component because FIG 0/8 is not emitted. |
+| `user-applications { userapp "slideshow" }` on every component | Implemented | YAML `services[].components[].user_applications: [slideshow]`; FIG 0/13 signals application type `0x2`, X-PAD application type `12` and MOT DSCTy `60`. DABlin decoded Slideshow on the 12-service test stream. FIG 0/8, which EN 300 401 clause 6.3.5 requires for components with user applications, is emitted for each of them, so secondary components can carry applications too. |
 | `tist true` | Implemented | TIST and EDI timestamps use either a fixed TAI–UTC offset or configured bulletin URLs. |
 | `tist_offset 2` | Implemented | YAML `ensemble.tist_offset_ms: 2000`; a live DETI check measured approximately 1.986 seconds of lead, and a live update to zero changed it to approximately −0.013 seconds. |
 | `tai_clock_bulletins ...` | Implemented | YAML `ensemble.tai_clock_bulletins` lists HTTPS URLs, tried in order at startup and refreshed hourly. A valid expired bulletin is a last resort, with a warning. There is no persistent cache across process restarts. |
@@ -32,18 +32,41 @@ The supplied layout totals **736 kbit/s**, **552 CUs**, **12 EST payloads** and 
 
 ## mux-zh reference configuration
 
-[`docs/reference-configs/mux-zh/mux.conf`](reference-configs/mux-zh/mux.conf) has 17 DAB+ services and an SPI data service. Its audio part converts to [`dabmux/config.mux-zh.example.yaml`](../dabmux/config.mux-zh.example.yaml), which validates and runs: 822 of 864 CUs, with `buffer 100` / `prebuffering 30` expressed once as `defaults.edi`. With SPI it would use 828 CUs.
+[`docs/reference-configs/mux-zh/mux.conf`](reference-configs/mux-zh/mux.conf) has 17 DAB+ services and an SPI data service. It converts to [`dabmux/config.mux-zh.example.yaml`](../dabmux/config.mux-zh.example.yaml), which validates and runs: 828 of 864 CUs, with `buffer 100` / `prebuffering 30` expressed once as `defaults.edi`.
 
-| Setting | Rust status | Needed |
+| Setting | Rust status | Detail |
 | --- | --- | --- |
-| `srv-spi`, `id 0x44010001` | Missing | 32-bit data service IDs (rejected today), FIG 0/2 data service entries, FIG 1/5 labels. |
-| `type enhancedpacket`, `bitrate 8` | Missing | Packet-mode subchannel and enhanced-packet FEC: RS(204,188) over a 12×188 frame, 9 FEC packets at address 1022, FIG 0/14. |
-| `inputproto file`, `load_entire_file true` | Missing | File input that reads one frame of packets per tick, loops, pads with null packets, and re-reads the file on each loop like C++, so a regenerated `spi.bin` is picked up. `spi.bin` holds 21,724 ready-made 24-byte packets at address 1. |
-| Component `type 60`, `address 0x1`, `datagroup true`, `userapp "spi"` | Missing | FIG 0/3 and FIG 0/13 with SPI (0x7) for packet components. The address must match the packet headers in the file. |
-| Service `ecc 0xE0` (BOLLERWAGEN, 0x1498) | Missing | Per-service ECC and the FIG 0/9 extended field. Without it, the service is signalled with ECC E1. |
+| `srv-spi`, `id 0x44010001` | Implemented | Data service with a 32-bit ID: FIG 0/2 with P/D = 1, FIG 1/5 label, FIG 0/8 and FIG 0/13 with the SPI basic profile. |
+| `type enhancedpacket`, `bitrate 8` | Implemented | `type: enhanced_packet`: packet mode with RS(204,188) FEC, nine FEC packets at address 1022, FIG 0/14 scheme 1. |
+| `inputproto file`, `load_entire_file true` | Implemented | `input: {protocol: file, path}`: the file is read whole, checked packet by packet, repeated, and replaced at its next wrap when it changes, like C++. A missing file sends padding packets. |
+| Component `type 60`, `address 0x1`, `datagroup true`, `userapp "spi"` | Implemented | `packet_address: 1` and `user_applications: [spi]`; DSCTy 60 and data groups are the defaults for SPI. FIG 0/3 signals them. |
+| Service `ecc 0xE0` (BOLLERWAGEN, 0x1498) | Implemented | `ecc: 0xe0`, signalled in the FIG 0/9 extended field. |
 | `outputs.zeromq` on `tcp://*:8950` | Out of scope by design | Needed only if a consumer of port 8950 cannot move to EDI. |
 
-Two values in the C++ config are worth checking with the operator: `0x44010001` decodes as ECC 0x44 and country 0 rather than E1/4, and `srv-rockantenne` (`0x121B`, a German ID) has no `ecc 0xE0`.
+**Verification.** Against ODR-DabMux v5.5.1 configured like `mux.conf` ([devsupport/cpp-reference/](../devsupport/cpp-reference/README.md)):
+- **Packet stream:** the Rust packet multiplexer reproduced the C++ sub-channel 30 output byte for byte over 24 501 frames of the full `spi.bin`, including the wrap, and all 237 FEC frames passed an independent syndrome check.
+- **FIGs:** the FIG 0/2, 0/3, 0/5, 0/8, 0/9, 0/13, 0/14, 1/0, 1/1 and 1/5 bytes match the C++ ones.
+- **Live run:** the Rust mux ran the mux-zh example. In 40 s of its TCP EDI output, sub-channel 30 had 16 FEC frames with zero syndromes, no packet CRC or continuity errors, and MSC data groups with valid CRCs. DABlin decoded the programme signalling, including the new FIG 0/8.
+
+No SPI receiver has displayed the guide yet.
+
+**Two values to check with the operator.** The C++ mux passes both through unchanged:
+- `0x44010001` decodes as ECC 0x44 and country 0 rather than E1/4; the Rust mux logs a warning for it.
+- `srv-rockantenne` (`0x121B`, a German ID) has no `ecc 0xE0`.
+
+## service-linking reference configuration
+
+[`docs/reference-configs/misc/service-linking.conf`](reference-configs/misc/service-linking.conf) is the ODR-DabMux example for service following. Its Rust counterpart is [`dabmux/config.service-linking.example.yaml`](../dabmux/config.service-linking.example.yaml).
+
+| Section | Rust status | Detail |
+| --- | --- | --- |
+| `linking { set-… }` | Implemented | `services[].linking`, with the service as key service; FIG 0/6. The ILS flag is derived (DRM/AMSS links or a foreign ECC), links follow the TS 103 176 transmission order and Step A/B split, `preference: low` sets IdLP, and an empty hard set is a dead link. Data service key services (P/D = 1) are supported. |
+| `other-services { … }` | Implemented | `services[].other_ensembles` (OE = 0) and top-level `other_services` (OE = 1); FIG 0/24, P/D from the service. |
+| `frequency_information { … }` | Implemented | Top-level `frequencies`, in MHz and stored as whole kHz; FIG 0/21 for DAB, FM, DRM (including mode E) and AMSS. OE is derived for DAB and, for other bearers, from whether the id belongs to a service here; `other_ensemble` overrides it. |
+| `service-component-information { … }` | Implemented | Top-level `service_changes`; FIG 0/20 with change type, part-time flag, component type, `at` date-time, transfer SId/EId, and an optional label for services not yet in the ensemble. |
+| CEI and activation changes | Implemented | Derived on reload: a changed or removed entry gets a CEI and an LA change gets the short form, each for 5 s, deactivations first. The C++ mux needs an explicit empty linkage set instead. |
+
+The fields match ODR-DabMux v5.5.1 for this config except where C++ departs from the standards; [devsupport/cpp-reference/README.md](../devsupport/cpp-reference/README.md) lists the differences. A live run of the Rust mux sent every field and, on reload, the LA = 0 short form for 4.95 s. No receiver has followed a link yet.
 
 ## Short-label semantics
 
@@ -51,7 +74,7 @@ Two values in the C++ config are worth checking with the operator: `0x44010001` 
 
 ## Additional advanced.mux capabilities outside this production example
 
-The reference also documents announcements, linking, frequency information, FIG 2/extended and component labels, multiple user applications, packet/data services, UEP, multicast input/output, PFT/FEC and packet spreading. They are not exposed by the current Rust model. The selected project scope still excludes non-EDI/STI inputs, non-EDI outputs and the C++ control protocols.
+The reference also documents announcements, linking, frequency information, FIG 2/extended and component labels, stream-mode data, UEP, multicast input/output, PFT/FEC and packet spreading. They are not exposed by the current Rust model. The selected project scope still excludes non-EDI/STI inputs, non-EDI outputs and the C++ control protocols.
 
 ## Deployment checks still needed
 

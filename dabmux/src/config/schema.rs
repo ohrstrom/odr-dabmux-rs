@@ -4,21 +4,25 @@
 //! [`Config::normalize`] turns this into the flat [`Multiplex`] the mux runs on.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
 use super::{
     number, service_name, Component, EdiOutputConfig, EnsembleConfig, InputConfig, InputTiming,
-    Multiplex, ProtectionConfig, Service, Subchannel, SubchannelKind, UserApplication,
-    ValidatedConfig,
+    Multiplex, PacketComponent, ProtectionConfig, Service, Subchannel, SubchannelKind,
+    UserApplication, ValidatedConfig,
 };
+use crate::config::linking::{FrequencyInformation, LinkageSet, OtherService, ServiceChange};
 
 /// Protection used when neither the subchannel nor `defaults` sets one.
 pub const DEFAULT_PROTECTION: ProtectionConfig = ProtectionConfig::EepA { level: 3 };
 pub const DEFAULT_STREAM_INDEX: u16 = 1;
 pub const DEFAULT_BUFFER_FRAMES: usize = 40;
 pub const DEFAULT_PREBUFFER_FRAMES: usize = 4;
+/// Data service component type MOT (TS 101 756 table 2b), used by SPI and slideshow.
+pub const DSCTY_MOT: u8 = 60;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +34,15 @@ pub struct Config {
     #[serde(default)]
     pub subchannels: BTreeMap<String, SubchannelConfig>,
     pub services: Vec<ServiceConfig>,
+    /// Services carried only in other ensembles (FIG 0/24 with OE = 1).
+    #[serde(default)]
+    pub other_services: Vec<OtherService>,
+    /// Frequency information (FIG 0/21).
+    #[serde(default)]
+    pub frequencies: Vec<FrequencyInformation>,
+    /// Advance information about service changes (FIG 0/20).
+    #[serde(default)]
+    pub service_changes: Vec<ServiceChange>,
     pub output: EdiOutputConfig,
 }
 
@@ -55,8 +68,13 @@ pub struct EdiDefaults {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
+    /// 16 bits for programme services; data services use the 32-bit form
+    /// with the ECC in its top byte.
     #[serde(deserialize_with = "number::deserialize")]
     pub id: u32,
+    /// ECC of a programme service from another country (FIG 0/9 extended field).
+    #[serde(default, deserialize_with = "number::option")]
+    pub ecc: Option<u8>,
     pub label: String,
     pub short_label: Option<String>,
     #[serde(default, deserialize_with = "number::deserialize")]
@@ -65,6 +83,12 @@ pub struct ServiceConfig {
     pub language: u8,
     /// In service order: the first is the primary component.
     pub components: Vec<ComponentConfig>,
+    /// Linkage sets with this service as the key service (FIG 0/6).
+    #[serde(default)]
+    pub linking: Vec<LinkageSet>,
+    /// Other ensembles that also carry this service (FIG 0/24).
+    #[serde(default, deserialize_with = "number::list")]
+    pub other_ensembles: Vec<u16>,
 }
 
 /// A component either defines its own subchannel (`type`, `bitrate`, `input`
@@ -83,6 +107,16 @@ pub struct ComponentConfig {
     pub input: Option<InputSpec>,
     #[serde(default)]
     pub user_applications: Vec<UserApplication>,
+    /// Packet mode only: the address of this component's packets, which must
+    /// match the packets in the input.
+    #[serde(default, deserialize_with = "number::option")]
+    pub packet_address: Option<u16>,
+    /// Packet mode only: data service component type; MOT (60) for `spi`
+    /// and `slideshow`.
+    #[serde(default, deserialize_with = "number::option")]
+    pub dscty: Option<u8>,
+    /// Packet mode only: whether MSC data groups are used (default true).
+    pub data_groups: Option<bool>,
 }
 
 /// A shared subchannel. `id` is the transmitted SubChId, allocated when unset.
@@ -116,9 +150,41 @@ pub enum InputSpec {
     Sti {
         uri: String,
     },
+    /// Ready-made packets for an `enhanced_packet` subchannel, read whole and
+    /// repeated; a changed file takes over when the current one wraps.
+    File {
+        path: PathBuf,
+    },
 }
 
 impl ComponentConfig {
+    /// Packet settings with defaults, for a component on a `kind` subchannel.
+    fn packet(&self, kind: &SubchannelKind) -> anyhow::Result<Option<PacketComponent>> {
+        if *kind != SubchannelKind::EnhancedPacket {
+            if self.packet_address.is_some() || self.dscty.is_some() || self.data_groups.is_some() {
+                bail!("packet_address, dscty and data_groups apply to packet mode components only");
+            }
+            return Ok(None);
+        }
+        let address = self
+            .packet_address
+            .context("packet mode components need packet_address")?;
+        let mot = self
+            .user_applications
+            .iter()
+            .any(|app| matches!(app, UserApplication::Spi | UserApplication::Slideshow));
+        let dscty = match self.dscty {
+            Some(dscty) => dscty,
+            None if mot => DSCTY_MOT,
+            None => bail!("packet mode components without a user application need dscty"),
+        };
+        Ok(Some(PacketComponent {
+            address,
+            dscty,
+            data_groups: self.data_groups.unwrap_or(true),
+        }))
+    }
+
     fn defines_subchannel(&self) -> bool {
         self.subchannel_id.is_some()
             || self.kind.is_some()
@@ -188,7 +254,7 @@ impl Config {
                                 drafts.push(Draft {
                                     name: name.clone(),
                                     id: shared.id,
-                                    kind: shared.kind.clone(),
+                                    kind: shared.kind,
                                     bitrate: shared.bitrate,
                                     protection: shared
                                         .protection
@@ -213,7 +279,7 @@ impl Config {
                         drafts.push(Draft {
                             name: format!("{}/{position}", service_name(service.id)),
                             id: component.subchannel_id,
-                            kind: kind.clone(),
+                            kind: *kind,
                             bitrate,
                             protection: component
                                 .protection
@@ -224,18 +290,25 @@ impl Config {
                         drafts.len() - 1
                     }
                 };
+                let packet = component
+                    .packet(&drafts[subchannel].kind)
+                    .with_context(|| path.clone())?;
                 components.push(Component {
                     service: index,
                     subchannel,
                     user_applications: component.user_applications.clone(),
+                    packet,
                 });
             }
             services.push(Service {
                 id: service.id,
+                ecc: service.ecc,
                 label: service.label.clone(),
                 short_label: service.short_label.clone(),
                 pty: service.pty,
                 language: service.language,
+                linking: service.linking.clone(),
+                other_ensembles: service.other_ensembles.clone(),
             });
         }
         if let Some(unused) = self
@@ -290,6 +363,9 @@ impl Config {
             services,
             subchannels,
             components,
+            other_services: self.other_services,
+            frequencies: self.frequencies,
+            service_changes: self.service_changes,
             output: self.output,
         })
     }
@@ -319,6 +395,7 @@ impl InputSpec {
                     .or(defaults.backpressure.filter(|_| uri.starts_with("tcp://"))),
             },
             Self::Sti { uri } => InputConfig::Sti { uri: uri.clone() },
+            Self::File { path } => InputConfig::File { path: path.clone() },
         }
     }
 }

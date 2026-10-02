@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,12 +6,16 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
+pub mod linking;
 mod number;
 pub mod reload;
 pub mod schema;
 pub mod watch;
 
 pub use schema::Config;
+
+/// Packet address reserved for the FEC packets of EN 300 401 clause 5.3.5.
+pub const FEC_PACKET_ADDRESS: u16 = dabmux::packet::FEC_ADDRESS;
 
 pub struct ConfigUpdate {
     pub candidate: ValidatedConfig,
@@ -118,16 +122,23 @@ pub struct Multiplex {
     pub subchannels: Vec<Subchannel>,
     /// Grouped by service, in component order within each service.
     pub components: Vec<Component>,
+    pub other_services: Vec<linking::OtherService>,
+    pub frequencies: Vec<linking::FrequencyInformation>,
+    pub service_changes: Vec<linking::ServiceChange>,
     pub output: EdiOutputConfig,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Service {
     pub id: u32,
+    /// Set for a programme service whose country differs from the ensemble's.
+    pub ecc: Option<u8>,
     pub label: String,
     pub short_label: Option<String>,
     pub pty: u8,
     pub language: u8,
+    pub linking: Vec<linking::LinkageSet>,
+    pub other_ensembles: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +148,16 @@ pub struct Component {
     /// Index into `subchannels`.
     pub subchannel: usize,
     pub user_applications: Vec<UserApplication>,
+    /// Set exactly for components on packet mode subchannels.
+    pub packet: Option<PacketComponent>,
+}
+
+/// How a component is carried in a packet mode subchannel (FIG 0/3).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PacketComponent {
+    pub address: u16,
+    pub dscty: u8,
+    pub data_groups: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,17 +184,27 @@ pub fn service_name(id: u32) -> String {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum UserApplication {
     Slideshow,
+    /// Service and Programme Information (TS 102 371), packet mode only.
+    Spi,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SubchannelKind {
     DabPlus,
     MpegAudio,
+    /// Packet mode with the RS FEC of EN 300 401 clause 5.3.5.
+    EnhancedPacket,
+}
+
+impl SubchannelKind {
+    pub fn is_audio(&self) -> bool {
+        matches!(self, Self::DabPlus | Self::MpegAudio)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -198,6 +229,9 @@ pub enum InputConfig {
     },
     Sti {
         uri: String,
+    },
+    File {
+        path: PathBuf,
     },
 }
 
@@ -225,21 +259,25 @@ impl std::fmt::Display for InputEndpoint {
 }
 
 impl InputConfig {
-    pub fn uri(&self) -> &str {
+    /// The configured URI or file path, for messages.
+    pub fn location(&self) -> String {
         match self {
-            Self::Edi { uri, .. } | Self::Sti { uri } => uri,
+            Self::Edi { uri, .. } | Self::Sti { uri } => uri.clone(),
+            Self::File { path } => path.display().to_string(),
         }
     }
 
-    pub fn endpoint(&self) -> anyhow::Result<InputEndpoint> {
-        let uri = self.uri();
+    /// The socket a network input listens on; `None` for a file input.
+    pub fn endpoint(&self) -> anyhow::Result<Option<InputEndpoint>> {
         let (transport, address) = match self {
-            Self::Edi { .. } => match (uri.strip_prefix("udp://"), uri.strip_prefix("tcp://")) {
+            Self::File { .. } => return Ok(None),
+            Self::Edi { uri, .. } => match (uri.strip_prefix("udp://"), uri.strip_prefix("tcp://"))
+            {
                 (Some(address), _) => (Transport::Udp, address),
                 (_, Some(address)) => (Transport::Tcp, address),
                 _ => bail!("EDI input URI must start with udp:// or tcp://"),
             },
-            Self::Sti { .. } => (
+            Self::Sti { uri } => (
                 Transport::Udp,
                 uri.strip_prefix("rtp://")
                     .context("STI input URI must start with rtp://")?,
@@ -253,7 +291,7 @@ impl InputConfig {
         let address = address
             .parse()
             .context("input URI needs an IP address and port")?;
-        Ok(InputEndpoint { transport, address })
+        Ok(Some(InputEndpoint { transport, address }))
     }
 
     /// Whether a full buffer should stall the producer instead of dropping.
@@ -262,9 +300,9 @@ impl InputConfig {
         match self {
             Self::Edi { backpressure, .. } => backpressure.unwrap_or_else(|| {
                 self.endpoint()
-                    .is_ok_and(|endpoint| endpoint.transport == Transport::Tcp)
+                    .is_ok_and(|endpoint| endpoint.is_some_and(|e| e.transport == Transport::Tcp))
             }),
-            Self::Sti { .. } => false,
+            Self::Sti { .. } | Self::File { .. } => false,
         }
     }
 }
@@ -312,6 +350,10 @@ fn default_tcp_queue() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedConfig {
     pub source: Multiplex,
+    /// In `source.services` order.
+    pub services: Vec<ValidatedService>,
+    /// Service following signalling (FIG 0/6, 0/20, 0/21, 0/24).
+    pub databases: linking::Databases,
     pub subchannels: Vec<ValidatedSubchannel>,
     /// Components in `source.components` order, with their SCIdS.
     pub components: Vec<ValidatedComponent>,
@@ -328,7 +370,17 @@ pub struct ValidatedSubchannel {
     pub size_cu: u16,
     pub payload_bytes: usize,
     pub tpl: u8,
-    pub endpoint: InputEndpoint,
+    /// `None` for a file input.
+    pub endpoint: Option<InputEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedService {
+    /// A data service: its primary component is in packet mode, and its ID
+    /// is signalled in 32-bit form (P/D = 1).
+    pub data: bool,
+    /// ECC for the FIG 0/9 extended field, if it differs from the ensemble's.
+    pub foreign_ecc: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,11 +391,31 @@ pub struct ValidatedComponent {
     pub subchannel: usize,
     /// Position within the service; 0 is the primary component.
     pub scids: u8,
+    /// Ensemble-wide SCId of a packet mode component (FIG 0/2, 0/3, 0/8).
+    pub scid: Option<u16>,
 }
 
 impl ValidatedConfig {
     pub fn service_components(&self, service: usize) -> impl Iterator<Item = &ValidatedComponent> {
         self.components.iter().filter(move |c| c.service == service)
+    }
+
+    /// Suspicious but valid settings, logged when the configuration starts.
+    pub fn warnings(&self) -> Vec<String> {
+        let ensemble_ecc = self.source.ensemble.ecc;
+        self.source
+            .services
+            .iter()
+            .zip(&self.services)
+            .filter(|(service, validated)| validated.data && (service.id >> 24) as u8 != ensemble_ecc)
+            .map(|(service, _)| {
+                format!(
+                    "data service {} carries ECC 0x{:02X} in its id, the ensemble ECC is 0x{ensemble_ecc:02X}",
+                    service_name(service.id),
+                    service.id >> 24
+                )
+            })
+            .collect()
     }
 
     /// Subchannels kept across an update whose allocated SubChId changed,
@@ -377,6 +449,7 @@ impl ValidatedConfig {
                 .enumerate()
                 .map(|(index, service)| ResolvedService {
                     service,
+                    data: self.services[index].data,
                     components: self
                         .components
                         .iter()
@@ -384,8 +457,10 @@ impl ValidatedConfig {
                         .filter(|(component, _)| component.service == index)
                         .map(|(component, raw)| ResolvedComponent {
                             scids: component.scids,
+                            scid: component.scid,
                             subchannel: &self.subchannels[component.subchannel].name,
                             user_applications: &raw.user_applications,
+                            packet: raw.packet.as_ref(),
                         })
                         .collect(),
                 })
@@ -406,6 +481,9 @@ impl ValidatedConfig {
                     input: &raw.input,
                 })
                 .collect(),
+            other_services: &source.other_services,
+            frequencies: &source.frequencies,
+            service_changes: &source.service_changes,
             output: &source.output,
         }
     }
@@ -416,6 +494,9 @@ pub struct ResolvedConfig<'a> {
     pub ensemble: &'a EnsembleConfig,
     pub services: Vec<ResolvedService<'a>>,
     pub subchannels: Vec<ResolvedSubchannel<'a>>,
+    pub other_services: &'a [linking::OtherService],
+    pub frequencies: &'a [linking::FrequencyInformation],
+    pub service_changes: &'a [linking::ServiceChange],
     pub output: &'a EdiOutputConfig,
 }
 
@@ -423,14 +504,19 @@ pub struct ResolvedConfig<'a> {
 pub struct ResolvedService<'a> {
     #[serde(flatten)]
     pub service: &'a Service,
+    pub data: bool,
     pub components: Vec<ResolvedComponent<'a>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ResolvedComponent<'a> {
     pub scids: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scid: Option<u16>,
     pub subchannel: &'a str,
     pub user_applications: &'a [UserApplication],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packet: Option<&'a PacketComponent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -511,7 +597,8 @@ impl Multiplex {
         }
 
         let mut service_ids = HashSet::new();
-        for service in &self.services {
+        let mut services = Vec::with_capacity(self.services.len());
+        for (index, service) in self.services.iter().enumerate() {
             let name = service_name(service.id);
             validate_label(&format!("service {name} label"), &service.label)?;
             if service.pty > 31 {
@@ -522,12 +609,44 @@ impl Multiplex {
                 &service.label,
                 service.short_label.as_deref(),
             )?;
-            if service.id > u32::from(u16::MAX) {
-                bail!("service {name} id exceeds 16-bit programme service range");
-            }
             if !service_ids.insert(service.id) {
                 bail!("duplicate service id: {name}");
             }
+            let primary = self
+                .components
+                .iter()
+                .find(|c| c.service == index)
+                .with_context(|| format!("service {name} has no component"))?;
+            let data = !self.subchannels[primary.subchannel].kind.is_audio();
+            if data {
+                if service.pty != 0 || service.language != 0 {
+                    bail!("data service {name}: pty and language apply to programme services only");
+                }
+                if service.ecc.is_some() {
+                    bail!("data service {name}: the ECC is the top byte of its 32-bit id");
+                }
+            } else if service.id > u32::from(u16::MAX) {
+                bail!("programme service {name} id must fit 16 bits");
+            }
+            services.push(ValidatedService {
+                data,
+                foreign_ecc: service.ecc.filter(|&ecc| ecc != self.ensemble.ecc),
+            });
+        }
+        // FIG 0/9 extended field: per ECC, sub-fields of up to three SIds,
+        // 25 bytes at most.
+        let mut foreign: HashMap<u8, usize> = HashMap::new();
+        for service in &services {
+            if let Some(ecc) = service.foreign_ecc {
+                *foreign.entry(ecc).or_default() += 1;
+            }
+        }
+        let extended_bytes: usize = foreign
+            .values()
+            .map(|count| count.div_ceil(3) * 2 + count * 2)
+            .sum();
+        if extended_bytes > 25 {
+            bail!("too many services with a foreign ecc for FIG 0/9 ({extended_bytes} > 25 bytes)");
         }
 
         let mut subchannel_ids = HashSet::new();
@@ -554,14 +673,21 @@ impl Multiplex {
             }
             let bytes = usize::from(sub.bitrate) * 3;
             payload_words += bytes / 4;
+            let packet_mode = sub.kind == SubchannelKind::EnhancedPacket;
+            let file_input = matches!(sub.input, InputConfig::File { .. });
+            if packet_mode != file_input {
+                bail!("subchannel {name}: enhanced_packet subchannels take a file input, and only they do");
+            }
             let endpoint = sub
                 .input
                 .endpoint()
                 .with_context(|| format!("subchannel {name} input"))?;
-            if !input_endpoints.insert(endpoint) {
-                bail!("duplicate input endpoint: {}", sub.input.uri());
+            if let Some(endpoint) = endpoint {
+                if !input_endpoints.insert(endpoint) {
+                    bail!("duplicate input endpoint: {}", sub.input.location());
+                }
             }
-            if endpoint.transport == Transport::Tcp {
+            if let Some(endpoint) = endpoint.filter(|e| e.transport == Transport::Tcp) {
                 tcp_input_ports.insert(endpoint.address.port());
             } else if matches!(
                 sub.input,
@@ -606,27 +732,64 @@ impl Multiplex {
         }
 
         let mut components = Vec::with_capacity(self.components.len());
-        let mut subchannel_languages = std::collections::HashMap::new();
+        let mut subchannel_languages = HashMap::new();
+        let mut packet_addresses = HashSet::new();
+        let mut next_scid = 0u16;
         for component in &self.components {
             let service = &self.services[component.service];
+            let data = services[component.service].data;
             let name = service_name(service.id);
             let scids = components
                 .iter()
                 .filter(|c: &&ValidatedComponent| c.service == component.service)
                 .count();
-            if scids >= 12 {
+            // FIG 0/2 holds 12 components for 16-bit SIds, 11 for 32-bit.
+            if scids >= if data { 11 } else { 12 } {
                 bail!("service {name} has too many components for FIG 0/2");
             }
-            if component.user_applications.len() > 1 {
-                bail!("service {name} component {scids} supports one slideshow application");
+            let kind = &self.subchannels[component.subchannel].kind;
+            let path = format!("service {name} component {scids}");
+            if data && kind.is_audio() {
+                bail!("{path}: a data service cannot carry audio components");
             }
-            // FIG 0/13 identifies secondary components by SCIdS, which needs
-            // FIG 0/8; only the primary component is addressable without it.
-            if scids > 0 && !component.user_applications.is_empty() {
-                bail!("service {name} user applications are only supported on its first component");
+            let mut applications = HashSet::new();
+            for application in &component.user_applications {
+                if !applications.insert(application) {
+                    bail!("{path} lists {application:?} twice");
+                }
+                if *application == UserApplication::Spi && kind.is_audio() {
+                    bail!("{path}: spi is supported in packet mode only");
+                }
             }
-            // FIG 0/5 signals language per subchannel.
-            if service.language != 0 {
+            let scid = match &component.packet {
+                Some(packet) => {
+                    if packet.address == 0
+                        || packet.address == FEC_PACKET_ADDRESS
+                        || packet.address > 1023
+                    {
+                        bail!("{path} packet_address must be 1..=1023 except 1022 (FEC)");
+                    }
+                    if packet.dscty > 63 {
+                        bail!("{path} dscty must be 0..=63");
+                    }
+                    if !packet_addresses.insert((component.subchannel, packet.address)) {
+                        bail!(
+                            "{path} packet_address {} is already used in subchannel {}",
+                            packet.address,
+                            self.subchannels[component.subchannel].name
+                        );
+                    }
+                    let scid = next_scid;
+                    next_scid += 1;
+                    if scid > 0x0fff {
+                        bail!("too many packet mode components for 12-bit SCIds");
+                    }
+                    Some(scid)
+                }
+                None => None,
+            };
+            // FIG 0/5 signals language per audio subchannel.
+            if service.language != 0 && kind.is_audio() {
                 let previous = subchannel_languages.insert(component.subchannel, service.language);
                 if previous.is_some_and(|previous| previous != service.language) {
                     bail!(
@@ -639,12 +802,8 @@ impl Multiplex {
                 service: component.service,
                 subchannel: component.subchannel,
                 scids: scids as u8,
+                scid,
             });
-        }
-        for (index, service) in self.services.iter().enumerate() {
-            if !components.iter().any(|c| c.service == index) {
-                bail!("service {} has no component", service_name(service.id));
-            }
         }
         let mut tcp_output_ports = HashSet::new();
         for destination in &self.output.destinations {
@@ -684,8 +843,11 @@ impl Multiplex {
         if (frame_words + 4) * 4 > 6144 {
             bail!("ETI frame exceeds 6144 bytes");
         }
+        let databases = linking::Databases::build(&self, &services)?;
         Ok(ValidatedConfig {
             source: self,
+            services,
+            databases,
             subchannels: validated,
             components,
             fic_words,
@@ -833,7 +995,10 @@ pub mod testing {
 
     pub fn service(id: u32, label: &str, components: Vec<ComponentConfig>) -> ServiceConfig {
         ServiceConfig {
+            linking: Vec::new(),
+            other_ensembles: Vec::new(),
             id,
+            ecc: None,
             label: label.into(),
             short_label: None,
             pty: 0,
@@ -978,12 +1143,14 @@ mod tests {
                 ValidatedComponent {
                     service: 0,
                     subchannel: 0,
-                    scids: 0
+                    scids: 0,
+                    scid: None
                 },
                 ValidatedComponent {
                     service: 1,
                     subchannel: 0,
-                    scids: 0
+                    scids: 0,
+                    scid: None
                 },
             ]
         );
@@ -1158,29 +1325,400 @@ output:
     }
 
     #[test]
-    fn user_applications_only_on_primary_component() {
+    fn secondary_components_may_carry_user_applications() {
         let mut config = example();
         let mut second = dab_plus(64, "udp://127.0.0.1:9002");
         second.user_applications = vec![UserApplication::Slideshow];
         config.services[0].components.push(second);
-        assert!(error(config.clone()).contains("only supported on its first component"));
-        config.services[0].components[1].user_applications.clear();
-        let valid = config.validate().unwrap();
+        let valid = config.clone().validate().unwrap();
         assert_eq!(
             valid.components,
             [
                 ValidatedComponent {
                     service: 0,
                     subchannel: 0,
-                    scids: 0
+                    scids: 0,
+                    scid: None
                 },
                 ValidatedComponent {
                     service: 0,
                     subchannel: 1,
-                    scids: 1
+                    scids: 1,
+                    scid: None
                 },
             ]
         );
+        config.services[0].components[1].user_applications = vec![UserApplication::Slideshow; 2];
+        assert!(error(config).contains("lists Slideshow twice"));
+    }
+
+    fn spi_component(address: u16) -> ComponentConfig {
+        ComponentConfig {
+            kind: Some(SubchannelKind::EnhancedPacket),
+            bitrate: Some(8),
+            input: Some(InputSpec::File {
+                path: "spi.bin".into(),
+            }),
+            packet_address: Some(address),
+            user_applications: vec![UserApplication::Spi],
+            ..Default::default()
+        }
+    }
+
+    fn with_spi() -> Config {
+        let mut config = example();
+        config
+            .services
+            .push(service(0xe1401001, "SPI", vec![spi_component(1)]));
+        config
+    }
+
+    #[test]
+    fn data_services_use_packet_mode_and_32_bit_ids() {
+        let valid = with_spi().validate().unwrap();
+        assert_eq!(
+            (valid.services[0].data, valid.services[1].data),
+            (false, true)
+        );
+        assert_eq!(valid.components[1].scid, Some(0));
+        assert_eq!(
+            valid.source.components[1].packet,
+            Some(PacketComponent {
+                address: 1,
+                dscty: 60,
+                data_groups: true
+            })
+        );
+        assert_eq!(valid.subchannels[1].payload_bytes, 24);
+        assert_eq!(valid.subchannels[1].endpoint, None);
+
+        let mut config = with_spi();
+        config.services[1].pty = 4;
+        assert!(error(config).contains("pty and language apply to programme services only"));
+        let mut config = with_spi();
+        config.services[1].ecc = Some(0xe0);
+        assert!(error(config).contains("the ECC is the top byte of its 32-bit id"));
+        let mut config = example();
+        config.services[0].id = 0x4da40001;
+        assert!(error(config).contains("programme service 4DA40001 id must fit 16 bits"));
+        let mut config = with_spi();
+        config.services[1]
+            .components
+            .push(dab_plus(64, "udp://127.0.0.1:9002"));
+        assert!(error(config).contains("a data service cannot carry audio components"));
+    }
+
+    #[test]
+    fn data_service_ecc_mismatch_is_a_warning() {
+        assert!(with_spi().validate().unwrap().warnings().is_empty());
+        let mut config = with_spi();
+        config.services[1].id = 0x44010001;
+        assert_eq!(
+            config.validate().unwrap().warnings(),
+            ["data service 44010001 carries ECC 0x44 in its id, the ensemble ECC is 0xE1"]
+        );
+    }
+
+    fn service_linking() -> Config {
+        parse_yaml(include_str!("../config.service-linking.example.yaml")).unwrap()
+    }
+
+    #[test]
+    fn service_following_flags_are_derived_from_content() {
+        let valid = service_linking().validate().unwrap();
+        let databases = &valid.databases;
+        let [fu, ri] = &databases.linkage[..] else {
+            panic!("two linkage sets")
+        };
+        assert_eq!((fu.international, ri.international), (false, true));
+        assert!(!ri.hard && ri.active);
+        // Key, then RDS, then DRM and AMSS (TS 103 176 clause 5.2.3).
+        let order: Vec<_> = ri.ids.iter().map(|id| (id.idlq, id.id, id.ecc)).collect();
+        assert_eq!(
+            order,
+            [
+                (0, 0x8dab, 0xec),
+                (1, 0x4c5d, 0x4f),
+                (3, 0xec1298, 0xec),
+                (3, 0xea1a2b, 0xea)
+            ]
+        );
+        let oe: Vec<_> = databases
+            .frequencies
+            .iter()
+            .map(|f| (f.id, f.other_ensemble))
+            .collect();
+        assert_eq!(
+            oe,
+            [
+                (0x4fff, false),
+                (0x1234, false),
+                (0xab45, false),
+                (0xcc88, false),
+                (0x4fee, true)
+            ]
+        );
+        let services: Vec<_> = databases
+            .other_ensembles
+            .iter()
+            .map(|e| (e.sid, e.other_ensemble))
+            .collect();
+        assert_eq!(services, [(0x8daa, false), (0x8daf, true)]);
+        assert_eq!(databases.changes.len(), 6);
+    }
+
+    #[test]
+    fn linkage_sets_are_checked() {
+        let check = |edit: &dyn Fn(&mut Config), expected: &str| {
+            let mut config = service_linking();
+            edit(&mut config);
+            let err = error(config);
+            assert!(err.contains(expected), "{err}");
+        };
+        check(
+            &|c| c.services[0].linking[0].lsn = 0,
+            "lsn must be 1..=0xFFF",
+        );
+        check(
+            &|c| c.services[1].linking[0].international = Some(false),
+            "international must be true",
+        );
+        check(
+            &|c| {
+                let mut second = c.services[0].linking[0].clone();
+                second.lsn = 0xabd;
+                c.services[0].linking.push(second);
+            },
+            "at most one hard and one soft linkage set may be active",
+        );
+        check(
+            &|c| c.services[1].linking[0].links.clear(),
+            "only a hard linkage set of a programme service may have no links",
+        );
+        check(
+            &|c| c.services[0].linking[0].links[0].id = 0x8daa,
+            "the key service is linked implicitly",
+        );
+        check(
+            &|c| {
+                let set = c.services[0].linking[0].clone();
+                c.services[1].linking.push(set);
+            },
+            "another linkage set has the same LSN",
+        );
+        check(
+            &|c| c.services[0].linking[0].links[1].id = 0x1_0000,
+            "Fm id 0x10000 exceeds 16 bits",
+        );
+        // A hard set without links is a dead link.
+        let mut config = service_linking();
+        config.services[0].linking[0].links.clear();
+        assert_eq!(config.validate().unwrap().databases.linkage[0].ids.len(), 1);
+    }
+
+    #[test]
+    fn frequency_information_is_checked() {
+        let check = |edit: &dyn Fn(&mut Config), expected: &str| {
+            let mut config = service_linking();
+            edit(&mut config);
+            let err = error(config);
+            assert!(err.contains(expected), "{err}");
+        };
+        use linking::FrequencyInformation as Fi;
+        let fm = |frequencies: Vec<u32>, continuity: bool, other_ensemble| Fi::Fm {
+            pi: 0x9999,
+            continuity,
+            other_ensemble,
+            frequencies: frequencies
+                .into_iter()
+                .map(|khz| number::Frequency { khz })
+                .collect(),
+        };
+        check(
+            &|c| c.frequencies.push(fm(vec![87_550], false, None)),
+            "not 87.6..=107.9 MHz in 100 kHz steps",
+        );
+        check(
+            &|c| c.frequencies.push(fm(vec![108_000], false, None)),
+            "not 87.6..=107.9 MHz",
+        );
+        check(
+            &|c| c.frequencies.push(fm(vec![99_000], true, None)),
+            "continuity applies to services of this ensemble only",
+        );
+        check(
+            &|c| c.frequencies.push(c.frequencies[0].clone()),
+            "repeats the frequency information",
+        );
+        check(
+            &|c| {
+                if let Fi::Dab { frequencies, .. } = &mut c.frequencies[0] {
+                    frequencies[0].mhz.khz = 234_210;
+                }
+            },
+            "not a multiple of 16 kHz",
+        );
+        // The PI code of a carried service is OE = 0 (implicit FM linking).
+        let mut config = service_linking();
+        config.frequencies.push(Fi::Fm {
+            pi: 0x8daa,
+            continuity: true,
+            other_ensemble: None,
+            frequencies: vec![number::Frequency { khz: 99_000 }],
+        });
+        // DRM in VHF band II uses robustness mode E and 10 kHz units.
+        config.frequencies.push(Fi::Drm {
+            id: 0x123456,
+            continuity: false,
+            other_ensemble: Some(true),
+            frequencies: vec![number::Frequency { khz: 100_000 }],
+        });
+        let valid = config.validate().unwrap();
+        let fm = valid
+            .databases
+            .frequencies
+            .iter()
+            .find(|f| f.id == 0x8daa)
+            .unwrap();
+        assert!(!fm.other_ensemble);
+        let drm = valid
+            .databases
+            .frequencies
+            .iter()
+            .find(|f| f.id == 0x3456)
+            .unwrap();
+        assert_eq!(drm.frequencies, [vec![0xa7, 0x10]]);
+    }
+
+    #[test]
+    fn service_changes_and_other_services_are_checked() {
+        let mut config = service_linking();
+        config.service_changes = vec![parse_yaml_change(
+            "{id: 0x1234, change: addition, ascty: 63, at: 2016-01-01T13:00:00Z, label: Neu, short_label: Neu}",
+        )];
+        let valid = config.validate().unwrap();
+        // TS 103 176 annex C.1: date 01100b, hour 01101b.
+        assert_eq!(valid.databases.changes[0].date_time, (0b01100, 13, 0, 0));
+        assert_eq!(
+            valid.databases.changes[0].description,
+            Some((false, false, 63))
+        );
+        assert_eq!(valid.databases.labels[0].label, "Neu");
+
+        let check = |change: &str, expected: &str| {
+            let mut config = service_linking();
+            config.service_changes = vec![parse_yaml_change(change)];
+            let err = error(config);
+            assert!(err.contains(expected), "{err}");
+        };
+        check(
+            "{id: 0x8daa, change: local_removal, label: Funk}",
+            "label of a carried service",
+        );
+        check(
+            "{id: 0x1234, change: addition, ascty: 1, dscty: 2}",
+            "set ascty or dscty, not both",
+        );
+        check(
+            "{id: 0x1234, change: identity, transfer_sid: 0x12345}",
+            "must fit 16 bits",
+        );
+
+        let mut config = service_linking();
+        config.other_services[0].id = 0x8dab;
+        assert!(error(config).contains("set other_ensembles on the service"));
+        let mut config = service_linking();
+        config.services[0].other_ensembles = vec![0x4ffe, 0x4ffe];
+        assert!(error(config).contains("lists ensemble 0x4FFE twice"));
+    }
+
+    fn parse_yaml_change(yaml: &str) -> linking::ServiceChange {
+        serde_norway::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn packet_settings_are_checked() {
+        let mut config = with_spi();
+        config.services[1].components[0].packet_address = None;
+        assert!(error(config).contains("packet mode components need packet_address"));
+
+        let mut config = with_spi();
+        config.services[1].components[0].user_applications.clear();
+        assert!(error(config).contains("without a user application need dscty"));
+
+        let mut config = example();
+        config.services[0].components[0].packet_address = Some(1);
+        assert!(error(config).contains("apply to packet mode components only"));
+
+        let mut config = with_spi();
+        config.services[1].components[0].packet_address = Some(1022);
+        assert!(error(config).contains("except 1022 (FEC)"));
+
+        let mut config = with_spi();
+        config.services[1].components[0].input = Some(InputSpec::Sti {
+            uri: "rtp://:9100".into(),
+        });
+        assert!(error(config).contains("enhanced_packet subchannels take a file input"));
+
+        let mut config = example();
+        config.services[0].components[0].input = Some(InputSpec::File {
+            path: "audio.bin".into(),
+        });
+        assert!(error(config).contains("enhanced_packet subchannels take a file input"));
+
+        let mut config = example();
+        config.services[0].components[0].user_applications = vec![UserApplication::Spi];
+        assert!(error(config).contains("spi is supported in packet mode only"));
+    }
+
+    #[test]
+    fn data_services_can_share_a_packet_subchannel() {
+        let mut config = example();
+        config.subchannels.insert(
+            "data".into(),
+            SubchannelConfig {
+                id: Some(30),
+                kind: SubchannelKind::EnhancedPacket,
+                bitrate: 16,
+                protection: None,
+                input: InputSpec::File {
+                    path: "data.bin".into(),
+                },
+            },
+        );
+        let on_shared = |address| ComponentConfig {
+            packet_address: Some(address),
+            user_applications: vec![UserApplication::Spi],
+            ..reference("data")
+        };
+        config
+            .services
+            .push(service(0xe1401001, "SPI", vec![on_shared(1)]));
+        config
+            .services
+            .push(service(0xe1401002, "SPI 2", vec![on_shared(2)]));
+        let valid = config.clone().validate().unwrap();
+        assert_eq!(valid.subchannels.len(), 2);
+        let scids: Vec<_> = valid.components.iter().map(|c| c.scid).collect();
+        assert_eq!(scids, [None, Some(0), Some(1)]);
+
+        config.services[2].components[0].packet_address = Some(1);
+        assert!(error(config).contains("packet_address 1 is already used in subchannel data"));
+    }
+
+    #[test]
+    fn foreign_service_eccs_must_fit_fig_zero_nine() {
+        let mut config = example();
+        for index in 0..10u16 {
+            let mut station = service(
+                0x1101 + u32::from(index),
+                &format!("Ausland {index}"),
+                vec![dab_plus(8, &format!("udp://127.0.0.1:{}", 9100 + index))],
+            );
+            station.ecc = Some(0xd0 + (index % 4) as u8);
+            config.services.push(station);
+        }
+        assert!(error(config).contains("too many services with a foreign ecc for FIG 0/9"));
     }
 
     #[test]
@@ -1194,7 +1732,11 @@ output:
             backpressure,
         };
         assert_eq!(
-            edi("tcp://:9000", None).endpoint().unwrap().to_string(),
+            edi("tcp://:9000", None)
+                .endpoint()
+                .unwrap()
+                .unwrap()
+                .to_string(),
             "tcp://0.0.0.0:9000"
         );
         assert_eq!(
@@ -1202,6 +1744,7 @@ output:
                 uri: "rtp://127.0.0.1:9002".into()
             }
             .endpoint()
+            .unwrap()
             .unwrap()
             .transport,
             Transport::Udp
@@ -1255,11 +1798,19 @@ output:
             .unwrap()
             .validate()
             .unwrap();
-        assert_eq!(valid.source.services.len(), 17);
+        assert_eq!(valid.source.services.len(), 18);
         assert_eq!(
             valid.subchannels.iter().map(|sub| sub.size_cu).sum::<u16>(),
-            822
+            828
         );
+        assert_eq!(valid.services.iter().filter(|s| s.data).count(), 1);
+        let boller = valid
+            .source
+            .services
+            .iter()
+            .position(|s| s.id == 0x1498)
+            .unwrap();
+        assert_eq!(valid.services[boller].foreign_ecc, Some(0xe0));
         assert!(valid.source.subchannels.iter().all(|sub| !sub.allocated));
         assert!(matches!(
             valid.source.subchannels[0].input,

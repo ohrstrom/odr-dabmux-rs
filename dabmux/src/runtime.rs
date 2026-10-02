@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration, MissedTickBehavior};
 
 use crate::config::{
@@ -23,6 +23,7 @@ use dabmux::edi::{
 use dabmux::frame::{
     assemble, cifs_per_transmission_frame, mnsc, FrameClock, Stream, FRAME_PERIOD_MS,
 };
+use dabmux::packet::{LoopingPackets, PacketMultiplexer};
 
 /// Close a TCP producer that sends nothing for this long (C++ uses 10 s too).
 const TCP_INPUT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,7 +109,9 @@ impl BufferedInput {
                 timing,
                 ..
             } => (*buffer_frames, *prebuffer_frames, *timing),
-            InputConfig::Sti { .. } => (64, 1, InputTiming::Prebuffering),
+            InputConfig::Sti { .. } | InputConfig::File { .. } => {
+                (64, 1, InputTiming::Prebuffering)
+            }
         };
         Self {
             rx,
@@ -368,6 +371,7 @@ async fn receive_input(
     let stream_index = match &input {
         InputConfig::Edi { stream_index, .. } => *stream_index,
         InputConfig::Sti { .. } => 1,
+        InputConfig::File { .. } => unreachable!("file inputs have no socket"),
     };
     let mut buf = vec![0u8; 65536];
     let mut pft = PftReassembler::default();
@@ -384,6 +388,7 @@ async fn receive_input(
                 packet.map(|packet| packet.map(|p| decode_sti_payload(&p, stream_index)))
             }
             InputConfig::Sti { .. } => Ok(Some(decode_sti_rtp(&buf[..size]))),
+            InputConfig::File { .. } => unreachable!("file inputs have no socket"),
         };
         match payload {
             Ok(Some(Ok(payload))) => {
@@ -415,29 +420,227 @@ enum InputSocket {
 }
 
 struct InputHandle {
-    endpoint: InputEndpoint,
     config: Subchannel,
-    socket: InputSocket,
-    task: tokio::task::JoinHandle<()>,
-    buffered: BufferedInput,
+    source: InputSource,
     underflowing: bool,
     reported_drops: u64,
 }
 
-impl InputHandle {
-    /// Only the input settings and the frame size matter to a running
-    /// receiver; ID, protection and name changes are applied in place.
-    fn serves(&self, endpoint: InputEndpoint, sub: &Subchannel) -> bool {
-        self.endpoint == endpoint
-            && self.config.input == sub.input
-            && self.config.bitrate == sub.bitrate
-    }
+enum InputSource {
+    Network(NetworkInput),
+    Packets(PacketInput),
 }
 
-impl Drop for InputHandle {
+struct NetworkInput {
+    endpoint: InputEndpoint,
+    socket: InputSocket,
+    task: tokio::task::JoinHandle<()>,
+    buffered: BufferedInput,
+}
+
+impl Drop for NetworkInput {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// What an input delivered for one frame.
+enum Payload {
+    Data(Vec<u8>),
+    /// Nothing usable; `substitute` keeps the subchannel valid (silence, or
+    /// padding packets with FEC).
+    Missing {
+        received: Option<usize>,
+        substitute: Vec<u8>,
+    },
+}
+
+impl InputHandle {
+    fn endpoint(&self) -> Option<InputEndpoint> {
+        match &self.source {
+            InputSource::Network(input) => Some(input.endpoint),
+            InputSource::Packets(_) => None,
+        }
+    }
+
+    /// Only the input settings and the frame size matter to a running
+    /// receiver; ID, protection and name changes are applied in place.
+    fn serves(
+        &self,
+        endpoint: Option<InputEndpoint>,
+        sub: &Subchannel,
+        addresses: &BTreeSet<u16>,
+    ) -> bool {
+        let packets_match = match &self.source {
+            InputSource::Packets(input) => input.addresses == *addresses,
+            InputSource::Network(_) => true,
+        };
+        self.endpoint() == endpoint
+            && self.config.input == sub.input
+            && self.config.bitrate == sub.bitrate
+            && packets_match
+    }
+
+    fn next_payload(&mut self, clock: FrameClock, stats: &RuntimeStats, bytes: usize) -> Payload {
+        match &mut self.source {
+            InputSource::Network(input) => match input.buffered.take(clock, stats) {
+                Some(data) if data.len() == bytes => Payload::Data(data),
+                data => Payload::Missing {
+                    received: data.as_ref().map(Vec::len),
+                    substitute: vec![0u8; bytes],
+                },
+            },
+            InputSource::Packets(input) => {
+                let (frame, had_data) = input.frame(bytes);
+                if had_data {
+                    Payload::Data(frame)
+                } else {
+                    Payload::Missing {
+                        received: None,
+                        substitute: frame,
+                    }
+                }
+            }
+        }
+    }
+
+    fn network(&self) -> Option<&NetworkInput> {
+        match &self.source {
+            InputSource::Network(input) => Some(input),
+            InputSource::Packets(_) => None,
+        }
+    }
+}
+
+/// Ready-made packets from a file, multiplexed with the clause 5.3.5 FEC.
+struct PacketInput {
+    /// Packet addresses configured for this subchannel, checked against the file.
+    addresses: BTreeSet<u16>,
+    source: LoopingPackets,
+    mux: PacketMultiplexer,
+    updates: watch::Receiver<Option<Arc<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PacketInput {
+    /// One frame, and whether it carried file data rather than padding only.
+    fn frame(&mut self, bytes: usize) -> (Vec<u8>, bool) {
+        if self.updates.has_changed().unwrap_or(false) {
+            let content = self.updates.borrow_and_update().clone();
+            self.source.replace(content);
+        }
+        let had_data = self.source.has_data();
+        (self.mux.frame(bytes, &mut self.source), had_data)
+    }
+}
+
+impl Drop for PacketInput {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// How often a packet input file is checked for changes.
+const PACKET_FILE_POLL: Duration = Duration::from_secs(2);
+
+/// Read `path` whenever its size or modification time changes, and publish
+/// valid content. An invalid file keeps the previous content; a missing one
+/// stops data at the next wrap, as in ODR-DabMux.
+async fn watch_packet_file(
+    name: String,
+    path: std::path::PathBuf,
+    addresses: BTreeSet<u16>,
+    tx: watch::Sender<Option<Arc<Vec<u8>>>>,
+    poll: Duration,
+) {
+    let mut seen = None;
+    let mut missing_warned = false;
+    loop {
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) => {
+                missing_warned = false;
+                let stamp = (metadata.len(), metadata.modified().ok());
+                if seen != Some(stamp) {
+                    seen = Some(stamp);
+                    match tokio::fs::read(&path)
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|content| Ok((dabmux::packet::scan_packets(&content)?, content)))
+                    {
+                        Ok((scan, content)) => {
+                            let unconfigured: Vec<_> =
+                                scan.addresses.difference(&addresses).collect();
+                            let absent: Vec<_> = addresses.difference(&scan.addresses).collect();
+                            if !unconfigured.is_empty() || !absent.is_empty() {
+                                tracing::warn!(subchannel = %name, path = %path.display(), ?unconfigured, ?absent, "packet addresses in the file do not match the configured components");
+                            }
+                            let message = if tx.borrow().is_some() {
+                                "packet file changed; it takes over when the current one wraps"
+                            } else {
+                                "packet file loaded"
+                            };
+                            tracing::info!(subchannel = %name, path = %path.display(), packets = scan.packets, bytes = content.len(), "{message}");
+                            let _ = tx.send(Some(Arc::new(content)));
+                        }
+                        Err(err) => {
+                            tracing::warn!(subchannel = %name, path = %path.display(), %err, "invalid packet file; keeping the previous content");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                if !missing_warned {
+                    tracing::warn!(subchannel = %name, path = %path.display(), %err, "packet file unavailable; sending padding after the current content");
+                    missing_warned = true;
+                }
+                if seen.take().is_some() {
+                    let _ = tx.send(None);
+                }
+            }
+        }
+        time::sleep(poll).await;
+    }
+}
+
+fn start_packet_input(
+    subchannel: Subchannel,
+    addresses: BTreeSet<u16>,
+    poll: Duration,
+) -> InputHandle {
+    let InputConfig::File { path } = &subchannel.input else {
+        unreachable!("packet inputs read files");
+    };
+    let (tx, updates) = watch::channel(None);
+    let task = tokio::spawn(watch_packet_file(
+        subchannel.name.clone(),
+        path.clone(),
+        addresses.clone(),
+        tx,
+        poll,
+    ));
+    InputHandle {
+        config: subchannel,
+        source: InputSource::Packets(PacketInput {
+            addresses,
+            source: LoopingPackets::default(),
+            mux: PacketMultiplexer::default(),
+            updates,
+            task,
+        }),
+        underflowing: false,
+        reported_drops: 0,
+    }
+}
+
+/// Configured packet addresses per subchannel index.
+fn packet_addresses(config: &ValidatedConfig, subchannel: usize) -> BTreeSet<u16> {
+    config
+        .source
+        .components
+        .iter()
+        .filter(|component| component.subchannel == subchannel)
+        .filter_map(|component| component.packet.as_ref().map(|packet| packet.address))
+        .collect()
 }
 
 struct TcpOutputHandle {
@@ -549,7 +752,9 @@ async fn prepare_resources(
         .chain(existing_outputs.iter().copied())
         .collect();
     for sub in &candidate.subchannels {
-        let endpoint = sub.endpoint;
+        let Some(endpoint) = sub.endpoint else {
+            continue;
+        };
         if existing_inputs.contains(&endpoint) || prepared.inputs.contains_key(&endpoint) {
             continue;
         }
@@ -596,7 +801,7 @@ fn start_input(
     let channel_capacity = match &input {
         _ if backpressure => 1,
         InputConfig::Edi { buffer_frames, .. } => *buffer_frames,
-        InputConfig::Sti { .. } => 64,
+        InputConfig::Sti { .. } | InputConfig::File { .. } => 64,
     };
     let (tx, rx) = mpsc::channel(channel_capacity);
     let buffered = BufferedInput::new(rx, &input);
@@ -629,11 +834,13 @@ fn start_input(
         }),
     };
     InputHandle {
-        endpoint,
         config: subchannel,
-        socket,
-        task,
-        buffered,
+        source: InputSource::Network(NetworkInput {
+            endpoint,
+            socket,
+            task,
+            buffered,
+        }),
         underflowing: false,
         reported_drops: 0,
     }
@@ -670,23 +877,34 @@ fn commit_resources(
     stats: &Arc<RuntimeStats>,
 ) {
     let mut next_inputs = Vec::with_capacity(candidate.source.subchannels.len());
-    for (sub, validated) in candidate
+    for (index, (sub, validated)) in candidate
         .source
         .subchannels
         .iter()
         .zip(&candidate.subchannels)
+        .enumerate()
     {
         let endpoint = validated.endpoint;
-        if let Some(position) = inputs.iter().position(|old| old.serves(endpoint, sub)) {
+        let addresses = packet_addresses(candidate, index);
+        if let Some(position) = inputs
+            .iter()
+            .position(|old| old.serves(endpoint, sub, &addresses))
+        {
             let mut handle = inputs.swap_remove(position);
             handle.config = sub.clone();
             next_inputs.push(handle);
             continue;
         }
-        let socket = if let Some(position) = inputs.iter().position(|old| old.endpoint == endpoint)
+        let Some(endpoint) = endpoint else {
+            next_inputs.push(start_packet_input(sub.clone(), addresses, PACKET_FILE_POLL));
+            continue;
+        };
+        let socket = if let Some(position) = inputs
+            .iter()
+            .position(|old| old.endpoint() == Some(endpoint))
         {
             let old = inputs.swap_remove(position);
-            let socket = old.socket.clone();
+            let socket = old.network().expect("network input").socket.clone();
             drop(old);
             socket
         } else {
@@ -760,7 +978,7 @@ fn mci(config: &ValidatedConfig) -> Mci {
                     (
                         config.subchannels[component.subchannel].id,
                         component.scids,
-                        config.source.subchannels[component.subchannel].kind.clone(),
+                        config.source.subchannels[component.subchannel].kind,
                     )
                 })
                 .collect();
@@ -908,6 +1126,9 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
     let mut tick = time::interval(Duration::from_millis(FRAME_PERIOD_MS));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous_tick = None;
+    for warning in initial.warnings() {
+        tracing::warn!("{warning}");
+    }
     let mut active = initial;
     let mut pending: Option<(ConfigUpdate, PreparedResources)> = None;
     let mut frame_failing = false;
@@ -917,7 +1138,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         let instant = tokio::select! {
             instant = tick.tick() => instant,
             Some(update) = updates.recv() => {
-                let input_endpoints: HashSet<_> = receivers.iter().map(|input: &InputHandle| input.endpoint).collect();
+                let input_endpoints: HashSet<_> = receivers.iter().filter_map(InputHandle::endpoint).collect();
                 let output_ports: HashSet<_> = tcp_outputs.iter().map(|output: &TcpOutputHandle| output.port).collect();
                 let prepared_tx = prepared_tx.clone();
                 let current_tai = Some((tai_clock.source.clone(), tai_clock.offset()));
@@ -977,6 +1198,9 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             } else {
                 clock = next_clock;
                 let structure_changed = mci(&candidate) != mci(&active);
+                for warning in candidate.warnings() {
+                    tracing::warn!("{warning}");
+                }
                 let reallocated = candidate.reallocated_subchannels(&active);
                 if !reallocated.is_empty() {
                     let changes = reallocated
@@ -1017,8 +1241,14 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 if tai_clock.source != new_tai_source {
                     tai_clock = TaiClock::new(new_tai_source, tai_offset);
                 }
+                let events = crate::fic::DatabaseEvents::between(&active, &candidate);
+                if !events.is_empty() {
+                    tracing::info!("service following databases changed; signalling change indications for 5 s");
+                }
                 active = candidate.clone();
-                carousel = FicCarousel::new().with_reconfiguration_counter(reconfiguration_counter);
+                carousel = FicCarousel::new()
+                    .with_reconfiguration_counter(reconfiguration_counter)
+                    .with_database_events(events, clock.count);
                 config.commit(candidate).await;
                 stats.config_activations.fetch_add(1, Ordering::Relaxed);
                 let _ = update.reply.send(Ok(true));
@@ -1028,21 +1258,28 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
 
         let mut payloads = Vec::with_capacity(active.subchannels.len());
         for (sub, input) in active.subchannels.iter().zip(&mut receivers) {
-            let data = match input.buffered.take(clock, &stats) {
-                Some(data) if data.len() == sub.payload_bytes => {
+            let data = match input.next_payload(clock, &stats, sub.payload_bytes) {
+                Payload::Data(data) => {
                     if input.underflowing {
                         tracing::info!(subchannel = %sub.name, "input recovered");
                         input.underflowing = false;
                     }
                     data
                 }
-                data => {
+                Payload::Missing {
+                    received,
+                    substitute,
+                } => {
                     stats.input_underflows.fetch_add(1, Ordering::Relaxed);
                     if !input.underflowing {
-                        tracing::warn!(subchannel = %sub.name, received_bytes = ?data.as_ref().map(Vec::len), expected_bytes = sub.payload_bytes, "input underflow; substituting silence");
+                        let substitute_kind = match input.source {
+                            InputSource::Network(_) => "silence",
+                            InputSource::Packets(_) => "padding packets",
+                        };
+                        tracing::warn!(subchannel = %sub.name, received_bytes = ?received, expected_bytes = sub.payload_bytes, substitute = substitute_kind, "input underflow");
                         input.underflowing = true;
                     }
-                    vec![0u8; sub.payload_bytes]
+                    substitute
                 }
             };
             payloads.push(data);
@@ -1050,6 +1287,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         stats.buffered_input_frames.store(
             receivers
                 .iter()
+                .filter_map(InputHandle::network)
                 .map(|input| input.buffered.queue.len() as u64)
                 .sum(),
             Ordering::Relaxed,
@@ -1092,10 +1330,15 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
 
         if clock.count.is_multiple_of(CLOCK_CHECK_FRAMES) {
             for (sub, input) in active.subchannels.iter().zip(&mut receivers) {
-                let dropped = input.buffered.overflow_drops - input.reported_drops;
-                input.reported_drops = input.buffered.overflow_drops;
+                let Some(network) = input.network() else {
+                    continue;
+                };
+                let (overflow_drops, transport) =
+                    (network.buffered.overflow_drops, network.endpoint.transport);
+                let dropped = overflow_drops - input.reported_drops;
+                input.reported_drops = overflow_drops;
                 if dropped >= DROP_WARN_FRAMES {
-                    let hint = if sub.endpoint.transport == Transport::Tcp {
+                    let hint = if transport == Transport::Tcp {
                         "enable backpressure (the TCP default) for unpaced encoders"
                     } else {
                         "pace the encoder in real time"
@@ -1396,5 +1639,77 @@ mod tests {
         assert_eq!(input.take(clock, &stats), Some(vec![2]));
         assert_eq!(stats.input_drops.load(Ordering::Relaxed), 1);
         assert_eq!(input.queue.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn packet_file_input_loads_switches_at_the_wrap_and_pads_when_missing() {
+        use dabmux::packet::{packet_address, verify_fec_stream, FEC_ADDRESS, PADDING_ADDRESS};
+        fn packet(address: u16) -> Vec<u8> {
+            let mut packet = vec![0u8; 24];
+            packet[0] = 0x30 | (address >> 8) as u8;
+            packet[1] = address as u8;
+            let crc = dabmux::edi::crc16(&packet[..22]);
+            packet[22..].copy_from_slice(&crc.to_be_bytes());
+            packet
+        }
+        let dir = std::env::temp_dir().join(format!("dabmux-packet-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("spi.bin");
+        std::fs::write(&path, [packet(1), packet(1)].concat()).unwrap();
+        let subchannel = Subchannel {
+            name: "spi".into(),
+            id: 30,
+            allocated: false,
+            kind: SubchannelKind::EnhancedPacket,
+            bitrate: 8,
+            protection: crate::config::ProtectionConfig::EepA { level: 3 },
+            input: InputConfig::File { path: path.clone() },
+        };
+        let mut input =
+            start_packet_input(subchannel, BTreeSet::from([1]), Duration::from_millis(10));
+        let stats = RuntimeStats::default();
+        let clock = FrameClock::new(0, 0, 0).unwrap();
+        let next = |input: &mut InputHandle| match input.next_payload(clock, &stats, 24) {
+            Payload::Data(data) => (true, data),
+            Payload::Missing { substitute, .. } => (false, substitute),
+        };
+        let mut stream = Vec::new();
+        let (had_data, frame) = next(&mut input);
+        assert!(
+            !had_data && packet_address(&frame) == PADDING_ADDRESS,
+            "padding before the load"
+        );
+        stream.extend(frame);
+        time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..2 {
+            let (had_data, frame) = next(&mut input);
+            assert!(had_data && packet_address(&frame) == 1);
+            stream.extend(frame);
+        }
+
+        // The old file has just wrapped, so a new one takes over at once;
+        // mid-file it would wait for the wrap.
+        std::fs::write(&path, [packet(2), packet(2), packet(2)].concat()).unwrap();
+        time::sleep(Duration::from_millis(100)).await;
+        let (_, frame) = next(&mut input);
+        assert_eq!(packet_address(&frame), 2);
+        stream.extend(frame);
+
+        // Without the file, data stops at the next wrap; FEC continues.
+        std::fs::remove_file(&path).unwrap();
+        time::sleep(Duration::from_millis(100)).await;
+        let mut addresses = Vec::new();
+        for _ in 0..210 {
+            let (_, frame) = next(&mut input);
+            addresses.push(packet_address(&frame));
+            stream.extend(frame);
+        }
+        assert_eq!(&addresses[..2], &[2, 2], "the rest of the current pass");
+        assert!(addresses[2..]
+            .iter()
+            .all(|&a| a == PADDING_ADDRESS || a == FEC_ADDRESS));
+        assert!(matches!(next(&mut input), (false, _)));
+        assert_eq!(verify_fec_stream(&stream), Ok(2));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -168,3 +168,28 @@ This entry recorded the state at that milestone; the next entry supersedes its r
 - Converted both example configs and added `dabmux/config.mux-zh.example.yaml` (17 audio services, 822 CUs; SPI, the service ECC override and ZeroMQ output pending). Verification: 55 tests, strict Clippy and rustfmt pass. A live run of the mux-zh config showed the resolved view, field-path errors on `POST /api/config`, and two file reloads (dropping SubChIds, then inserting a service at the front) activating with the reallocation warning.
 
 **Next:** SPI support on the new model: 32-bit data services, per-service ECC, packet subchannel and component fields, then the file input and enhanced-packet FEC.
+
+### 2026-10-01 — SPI: data services in enhanced packet mode
+
+- Downloaded the ETSI standards to `docs/etsi/pdf/` (gitignored), including EN 300 401 V2.2.1 (2026-06). Two V2.2.1 rules shaped this work: packet mode sub-channels shall apply the clause 5.3.5 FEC, so there is only `type: enhanced_packet`; and FIG 0/8 shall be signalled for every component with user applications, including slideshow in PAD, which the mux previously omitted.
+- `dabmux::packet` (library): packet CRC and scanning, padding packets, the RS(204,188) encoder, the FEC frame (12 × 188 table, nine FEC packets at address 1022), the frame multiplexer and an independent syndrome-based stream verifier. Against ODR-DabMux v5.5.1 configured like `mux.conf`, the output is byte-identical over 24 501 frames of the full mux-zh `spi.bin`; a 401-frame slice is a test fixture ([devsupport/cpp-reference/](../devsupport/cpp-reference/README.md)).
+- Configuration: data services (32-bit IDs, primary component in packet mode, no PTY or language), programme service `ecc`, packet component `packet_address`, `dscty` and `data_groups` (MOT and data groups by default for `spi`/`slideshow`), `user_applications: [spi]`, and the file input. Validation covers address range and uniqueness per sub-channel, input/type pairing, component limits (11 for 32-bit SIds) and the 25-byte FIG 0/9 extended field. A data service SId whose ECC differs from the ensemble's is logged as a warning, as for mux-zh's `0x44010001`.
+- Runtime: the file input checks the whole file, repeats it, and adopts a changed file at its next wrap (at once when at a wrap); a damaged file keeps the previous content and a missing file pads. File addresses are compared with the configured components.
+- FIC: new FIG 0/2 data-service and packet-component entries, 0/3, 0/8, 0/9 extended field, 0/13 with P/D = 1 and the SPI basic profile, 0/14 and 1/5. The carousel was rebuilt as a priority scheme: 0/0 and 0/7, then 0/10 and one label per frame, then one complete MCI pass per 96 ms, then all remaining space for 0/5, 0/8, 0/9, 0/13 and 0/17. For mux-zh with SPI a test confirms complete MCI in every 96 ms period and every information entry and label within 41 frames over 1 000 frames; the previous fixed-slot carousel needed about 1.3 s for FIG 0/13 alone at 17 services. The FIG bytes for the SPI reference match ODR-DabMux.
+- Verification: 70 tests, strict Clippy and rustfmt pass. A release-build run of the mux-zh example produced EDI whose sub-channel 30 had 16 FEC frames with zero syndromes, no packet CRC or continuity errors and CRC-valid MOT data groups; DABlin decoded the programme signalling including FIG 0/8.
+
+**Still open:** an SPI-capable receiver test, ZeroMQ output (out of scope unless required), packet input over the network, advance reconfiguration signalling, UEP, PFT FEC and multicast.
+
+### 2026-10-01 — service following (FIG 0/6, 0/20, 0/21, 0/24)
+
+- Downloaded TS 103 176 V2.6.1 and TR 101 496-2. Implemented service linking, OE services, frequency information and service component information against EN 300 401 V2.2.1 and TS 103 176. Linkage sets are configured on their key service; FI, foreign services and announced changes at the top level ([specs/configuration.md](specs/configuration.md)). ILS, P/D and the OE flag of DAB FI are derived; link order and field split follow TS 103 176 clause 5.2.4.1, including dead links, IdLP preference and data service key services.
+- Frequencies are written in MHz and kept as whole kHz, so FM codes are exact (ODR-DabMux truncates 87.6 MHz to code 0). DRM above 32.767 MHz uses the mode E multiplier.
+- FIC: the database definitions get a credited share of the FIC, 4 bytes per frame and up to a FIB, so large fields still fit. FIG 0/20 and change indications join the once-per-second rotation. Labels are paced to one cycle per 40 frames instead of one per frame, which freed about 500 bytes/s for mux-zh. With linking and OE services on all 17 mux-zh services, a test confirms every database entry within 10 s and all information within 41 frames.
+- Hot reload derives CEIs for changed or removed database entries and short-form activation state for LA changes, sent for five seconds with the affected definitions withheld until then.
+- Verification:
+  - **C++ capture:** the fields of the converted example match ODR-DabMux v5.5.1 where it follows the standards; the departures are documented in [devsupport/cpp-reference/README.md](../devsupport/cpp-reference/README.md).
+  - **Date-time:** the FIG 0/20 encoding reproduces TS 103 176 annex C.1.
+  - **Live run:** a release-build run sent every field, cycling the whole database every 30 frames. A watched-file reload that deactivated a linkage set sent its short form for 4.95 s and then the LA = 0 definition.
+  - **Suite:** 77 tests, strict Clippy and rustfmt pass.
+
+**Still open:** a receiver that follows links, OE announcements (FIG 0/25, 0/26) and announcement support (FIG 0/18, 0/19).
