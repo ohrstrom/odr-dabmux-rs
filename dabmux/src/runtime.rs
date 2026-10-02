@@ -33,6 +33,32 @@ const CLOCK_DRIFT_WARN_MS: i64 = 100;
 const CLOCK_CHECK_FRAMES: u64 = 250;
 /// Warn when an input overflows this many frames within one check period.
 const DROP_WARN_FRAMES: u64 = 10;
+/// After a stall the mux sends the late frames back to back, each with its
+/// scheduled frame count and TIST, as ODR-DabMux does: a TIST modulator still
+/// plays them. Beyond this lag they are too late for any TIST offset and a
+/// burst would overflow the TCP output queues, so the mux skips ahead instead.
+const MAX_CATCH_UP: Duration = Duration::from_secs(10);
+
+/// How to handle a frame whose tick was due `lag` ago.
+#[derive(Debug, PartialEq, Eq)]
+enum CatchUp {
+    OnTime,
+    /// Sent at least one frame period late, in a catch-up burst.
+    Late,
+    /// Skip this many frames to return to the schedule.
+    Skip(u64),
+}
+
+fn catch_up(lag: Duration) -> CatchUp {
+    let period = Duration::from_millis(FRAME_PERIOD_MS);
+    if lag > MAX_CATCH_UP {
+        CatchUp::Skip((lag.as_micros() / period.as_micros()) as u64)
+    } else if lag >= period {
+        CatchUp::Late
+    } else {
+        CatchUp::OnTime
+    }
+}
 
 #[derive(Default)]
 pub struct RuntimeStats {
@@ -44,6 +70,7 @@ pub struct RuntimeStats {
     pub decode_errors: AtomicU64,
     pub send_errors: AtomicU64,
     pub missed_ticks: AtomicU64,
+    pub catch_up_frames: AtomicU64,
     pub buffered_input_frames: AtomicU64,
     pub late_input_frames: AtomicU64,
     pub invalid_timestamps: AtomicU64,
@@ -62,6 +89,7 @@ impl RuntimeStats {
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
             send_errors: self.send_errors.load(Ordering::Relaxed),
             missed_ticks: self.missed_ticks.load(Ordering::Relaxed),
+            catch_up_frames: self.catch_up_frames.load(Ordering::Relaxed),
             buffered_input_frames: self.buffered_input_frames.load(Ordering::Relaxed),
             late_input_frames: self.late_input_frames.load(Ordering::Relaxed),
             invalid_timestamps: self.invalid_timestamps.load(Ordering::Relaxed),
@@ -80,7 +108,10 @@ pub struct StatsSnapshot {
     input_size_mismatches: u64,
     decode_errors: u64,
     send_errors: u64,
+    /// Frames skipped after falling more than `MAX_CATCH_UP` behind.
     missed_ticks: u64,
+    /// Frames sent late, back to back, to catch up after a stall.
+    catch_up_frames: u64,
     buffered_input_frames: u64,
     late_input_frames: u64,
     invalid_timestamps: u64,
@@ -1124,8 +1155,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
     let mut carousel = FicCarousel::new().with_reconfiguration_counter(reconfiguration_counter);
     let mut seq = 0u16;
     let mut tick = time::interval(Duration::from_millis(FRAME_PERIOD_MS));
-    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut previous_tick = None;
+    tick.set_missed_tick_behavior(MissedTickBehavior::Burst);
     for warning in initial.warnings() {
         tracing::warn!("{warning}");
     }
@@ -1156,21 +1186,26 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 continue;
             }
         };
-        if let Some(previous) = previous_tick {
-            let elapsed_ticks = (instant.duration_since(previous).as_micros()
-                / u128::from(FRAME_PERIOD_MS * 1000))
-            .max(1);
-            let skipped = elapsed_ticks.saturating_sub(1);
-            if skipped > 0 {
-                stats
-                    .missed_ticks
-                    .fetch_add(skipped as u64, Ordering::Relaxed);
-                for _ in 0..skipped {
+        match catch_up(time::Instant::now().saturating_duration_since(instant)) {
+            CatchUp::OnTime => {}
+            CatchUp::Late => {
+                stats.catch_up_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            CatchUp::Skip(frames) => {
+                // Keep the 24 ms grid: this frame takes the slot `frames` later.
+                stats.missed_ticks.fetch_add(frames, Ordering::Relaxed);
+                for _ in 0..frames {
                     clock.tick();
                 }
+                let period = Duration::from_millis(FRAME_PERIOD_MS);
+                tick.reset_at(instant + period * (frames as u32 + 1));
+                tracing::warn!(
+                    skipped_frames = frames,
+                    "mux fell more than {} s behind; skipping ahead instead of catching up",
+                    MAX_CATCH_UP.as_secs()
+                );
             }
         }
-        previous_tick = Some(instant);
 
         // Switch configurations only where a transmission frame begins.
         let frame_boundary = clock
@@ -1711,5 +1746,38 @@ mod tests {
         assert!(matches!(next(&mut input), (false, _)));
         assert_eq!(verify_fec_stream(&stream), Ok(2));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn late_frames_are_caught_up_in_a_burst_up_to_ten_seconds() {
+        let ms = Duration::from_millis;
+        assert_eq!(catch_up(ms(0)), CatchUp::OnTime);
+        assert_eq!(catch_up(ms(23)), CatchUp::OnTime);
+        assert_eq!(catch_up(ms(24)), CatchUp::Late);
+        assert_eq!(catch_up(ms(10_000)), CatchUp::Late);
+        // 10.008 s behind: 417 whole frames to skip.
+        assert_eq!(catch_up(ms(10_008)), CatchUp::Skip(417));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_ticks_keep_their_scheduled_instants() {
+        let period = Duration::from_millis(FRAME_PERIOD_MS);
+        let mut tick = time::interval(period);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Burst);
+        let start = tick.tick().await;
+        time::advance(Duration::from_millis(100)).await;
+        // Four ticks were due during the stall; they come at once, on schedule.
+        for n in 1..=4u32 {
+            let instant = tick.tick().await;
+            assert_eq!(instant, start + period * n);
+            assert_eq!(
+                catch_up(time::Instant::now() - instant),
+                if n < 4 {
+                    CatchUp::Late
+                } else {
+                    CatchUp::OnTime
+                }
+            );
+        }
     }
 }

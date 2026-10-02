@@ -193,3 +193,9 @@ This entry recorded the state at that milestone; the next entry supersedes its r
   - **Suite:** 77 tests, strict Clippy and rustfmt pass.
 
 **Still open:** a receiver that follows links, OE announcements (FIG 0/25, 0/26) and announcement support (FIG 0/18, 0/19).
+
+### 2026-10-02 — frame timing after stalls
+
+- Investigated a 35-minute FIG 0/10 lag after an overnight run on a laptop. The macOS power log shows 33 minutes of lid-closed sleep, and Rust's `Instant` (`CLOCK_UPTIME_RAW` on Apple) does not advance during sleep. The frame clock, like ODR-DabMux's `MuxTime`, is set from system time once and then advances 24 ms per frame. Servers do not sleep, so this is not addressed; `clock_drift_ms` and its warning still report it. On Linux both muxes pace on `CLOCK_MONOTONIC` and keep the NTP-disciplined rate.
+- Catch-up now follows ODR-DabMux: late frames are sent back to back with their scheduled DLFC and TIST (tokio `MissedTickBehavior::Burst`), counted as `catch_up_frames`. Previously late frames were skipped, which lost 24 ms of audio each. Beyond 10 s behind, the mux skips ahead on the 24 ms grid (`missed_ticks`, logged), because such frames are useless to TIST modulators and would overflow the 500-frame TCP client queues.
+- Verification: unit tests for the catch-up decision and for the scheduled instants of burst ticks. A live release run frozen with SIGSTOP for 2 s sent 84 frames within 6 ms on resume, with contiguous DLFC (`catch_up_frames` 83). Frozen for 12 s, it skipped 500 frames in one DLFC jump and continued in real time.

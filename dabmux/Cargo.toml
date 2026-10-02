@@ -25,5 +25,6 @@ name = "dabmux"
 path = "src/main.rs"
 
 [dev-dependencies]
+tokio = { version = "1.44", features = ["test-util"] }
 log = "0.4"
 thiserror = "2"
