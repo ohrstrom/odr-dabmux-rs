@@ -25,14 +25,67 @@ pub struct ConfigUpdate {
 #[derive(Clone)]
 pub struct SharedConfig {
     active: Arc<RwLock<ValidatedConfig>>,
+    /// The operator configuration `active` was built from, for editing.
+    source: Arc<RwLock<Revision>>,
     updates: Arc<Mutex<Option<mpsc::Sender<ConfigUpdate>>>>,
     update_lock: Arc<Mutex<()>>,
 }
 
+/// An operator configuration and its revision, which counts accepted
+/// configurations since startup.
+#[derive(Debug, Clone)]
+pub struct Revision {
+    pub number: u64,
+    pub config: Config,
+}
+
+/// The outcome of an accepted configuration.
+#[derive(Debug, Clone, Serialize)]
+pub struct Applied {
+    /// Whether the running multiplex changed.
+    pub changed: bool,
+    pub revision: u64,
+    /// Valid but noteworthy consequences, such as reallocated SubChIds.
+    pub warnings: Vec<String>,
+}
+
+/// Why an edit of the operator configuration was not applied.
+#[derive(Debug)]
+pub enum EditError {
+    NotFound(String),
+    Conflict(String),
+    /// The edit was based on an older revision.
+    Stale(String),
+    /// The edited configuration is invalid or the runtime refused it.
+    Rejected(anyhow::Error),
+}
+
+impl From<anyhow::Error> for EditError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Rejected(err)
+    }
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(message) | Self::Conflict(message) | Self::Stale(message) => {
+                f.write_str(message)
+            }
+            Self::Rejected(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
 impl SharedConfig {
-    pub fn new(config: ValidatedConfig) -> Self {
+    /// `validated` must be `source` validated.
+    pub fn new(source: Config, validated: ValidatedConfig) -> Self {
         Self {
-            active: Arc::new(RwLock::new(config)),
+            active: Arc::new(RwLock::new(validated)),
+            source: Arc::new(RwLock::new(Revision {
+                number: 1,
+                config: source,
+            })),
             updates: Arc::new(Mutex::new(None)),
             update_lock: Arc::new(Mutex::new(())),
         }
@@ -40,6 +93,11 @@ impl SharedConfig {
 
     pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, ValidatedConfig> {
         self.active.read().await
+    }
+
+    /// The operator configuration of the running multiplex.
+    pub async fn source(&self) -> Revision {
+        self.source.read().await.clone()
     }
 
     pub async fn install_updates(&self, sender: mpsc::Sender<ConfigUpdate>) {
@@ -50,11 +108,66 @@ impl SharedConfig {
         *self.active.write().await = config;
     }
 
-    pub async fn replace_if_changed(&self, config: ValidatedConfig) -> anyhow::Result<bool> {
+    /// Validate `candidate` and hand it to the runtime unless it runs
+    /// an identical multiplex already.
+    pub async fn apply(&self, candidate: Config) -> anyhow::Result<Applied> {
         let _guard = self.update_lock.lock().await;
-        if *self.active.read().await == config {
-            return Ok(false);
+        self.apply_locked(candidate).await
+    }
+
+    /// Apply a change to a copy of the operator configuration. `revision`,
+    /// when given, must still be current, so that edits based on an older
+    /// configuration are refused rather than undoing a newer one.
+    pub async fn edit<T>(
+        &self,
+        revision: Option<u64>,
+        change: impl FnOnce(&mut Config) -> Result<T, EditError>,
+    ) -> Result<(T, Applied), EditError> {
+        let _guard = self.update_lock.lock().await;
+        let current = self.source().await;
+        if let Some(expected) = revision.filter(|expected| *expected != current.number) {
+            return Err(EditError::Stale(format!(
+                "configuration changed since revision {expected}; it is at revision {} now",
+                current.number
+            )));
         }
+        let mut candidate = current.config;
+        let value = change(&mut candidate)?;
+        Ok((value, self.apply_locked(candidate).await?))
+    }
+
+    async fn apply_locked(&self, candidate: Config) -> anyhow::Result<Applied> {
+        let validated = candidate.clone().validate()?;
+        let mut warnings = validated.warnings();
+        let changed = {
+            let active = self.active.read().await;
+            if *active == validated {
+                false
+            } else {
+                warnings.extend(validated.reallocated_subchannels(&active).into_iter().map(
+                    |(name, from, to)| {
+                        format!("{name}: allocated SubChId changes from {from} to {to}; receivers lose the service until they rescan")
+                    },
+                ));
+                true
+            }
+        };
+        if changed {
+            self.send_to_runtime(validated).await?;
+        }
+        let mut source = self.source.write().await;
+        if source.config != candidate {
+            source.number += 1;
+            source.config = candidate;
+        }
+        Ok(Applied {
+            changed,
+            revision: source.number,
+            warnings,
+        })
+    }
+
+    async fn send_to_runtime(&self, config: ValidatedConfig) -> anyhow::Result<bool> {
         let sender = self
             .updates
             .lock()
@@ -72,10 +185,6 @@ impl SharedConfig {
         result
             .await
             .context("mux runtime stopped during config update")?
-    }
-
-    pub async fn apply(&self, candidate: Config) -> anyhow::Result<bool> {
-        self.replace_if_changed(candidate.validate()?).await
     }
 }
 
@@ -930,13 +1039,20 @@ pub fn short_label_mask(path: &str, label: &str, short_label: Option<&str>) -> a
     bail!("{path} must be a character subsequence of the full label")
 }
 
-pub fn load_from_file(path: &Path) -> anyhow::Result<ValidatedConfig> {
+/// Read the operator configuration of `path`, without validating it.
+pub fn read_file(path: &Path) -> anyhow::Result<Config> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    parse_yaml(&raw)
-        .with_context(|| format!("failed to parse config {}", path.display()))?
+    parse_yaml(&raw).with_context(|| format!("failed to parse config {}", path.display()))
+}
+
+pub fn load_from_file(path: &Path) -> anyhow::Result<(Config, ValidatedConfig)> {
+    let source = read_file(path)?;
+    let validated = source
+        .clone()
         .validate()
-        .with_context(|| format!("invalid config {}", path.display()))
+        .with_context(|| format!("invalid config {}", path.display()))?;
+    Ok((source, validated))
 }
 
 /// Parse YAML config; errors name the offending field, e.g.
@@ -1851,7 +1967,7 @@ output:
     #[tokio::test]
     async fn invalid_candidate_does_not_replace_active_config() {
         let initial = example().validate().unwrap();
-        let shared = SharedConfig::new(initial.clone());
+        let shared = SharedConfig::new(example(), initial.clone());
         let mut invalid = example();
         invalid.services[0].components.clear();
         assert!(invalid.validate().is_err());
@@ -1868,11 +1984,74 @@ output:
         });
         let mut changed = example();
         changed.services[0].label = "New Label".into();
-        assert!(shared.apply(changed).await.unwrap());
+        assert!(shared.apply(changed).await.unwrap().changed);
         assert_eq!(shared.read().await.source.services[0].label, "New Label");
         let mut layout_change = example();
         layout_change.services[0].components[0].bitrate = Some(104);
-        assert!(shared.apply(layout_change).await.unwrap());
+        assert!(shared.apply(layout_change).await.unwrap().changed);
         assert_eq!(shared.read().await.subchannels[0].bitrate, 104);
+    }
+
+    #[test]
+    fn operator_config_survives_a_json_round_trip() {
+        for path in [
+            "config.example.yaml",
+            "config.production.example.yaml",
+            "config.mux-zh.example.yaml",
+            "config.service-linking.example.yaml",
+            "tests/fixtures/minimal.yaml",
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+            let config = read_file(&path).unwrap();
+            let json = serde_json::to_vec(&config).unwrap();
+            assert_eq!(parse_json(&json).unwrap(), config, "{}", path.display());
+        }
+    }
+
+    /// Commits every update, as the runtime does with valid ones.
+    async fn accepting_runtime(shared: &SharedConfig) {
+        let (tx, mut rx) = mpsc::channel(1);
+        shared.install_updates(tx).await;
+        let worker = shared.clone();
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                worker.commit(update.candidate).await;
+                let _ = update.reply.send(Ok(true));
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn edits_apply_to_a_copy_and_need_the_current_revision() {
+        let shared = SharedConfig::new(example(), example().validate().unwrap());
+        accepting_runtime(&shared).await;
+
+        let (_, applied) = shared
+            .edit(Some(1), |config| {
+                config.services[0].label = "Edited".into();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!((applied.changed, applied.revision), (true, 2));
+        assert_eq!(shared.source().await.config.services[0].label, "Edited");
+        assert_eq!(shared.read().await.source.services[0].label, "Edited");
+
+        let stale = shared.edit(Some(1), |_| Ok(())).await;
+        assert!(matches!(stale, Err(EditError::Stale(_))));
+
+        let invalid = shared
+            .edit(None, |config| {
+                config.services[0].components.clear();
+                Ok(())
+            })
+            .await;
+        assert!(matches!(invalid, Err(EditError::Rejected(_))));
+        let source = shared.source().await;
+        assert_eq!(source.number, 2);
+        assert_eq!(source.config.services[0].components.len(), 1);
+
+        let (_, unchanged) = shared.edit(Some(2), |_| Ok(())).await.unwrap();
+        assert_eq!((unchanged.changed, unchanged.revision), (false, 2));
     }
 }

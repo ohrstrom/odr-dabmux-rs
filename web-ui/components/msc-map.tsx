@@ -14,9 +14,9 @@ import {
 import { href } from "@/hooks/use-route"
 
 const TYPE_CLASSES: Record<SubchannelType, string> = {
-  dab_plus: "bg-primary/85 hover:bg-primary",
-  mpeg_audio: "bg-primary/55 hover:bg-primary/70",
-  enhanced_packet: "bg-chart-2 hover:bg-chart-3",
+  dab_plus: "bg-msc-dab-plus",
+  mpeg_audio: "bg-msc-mpeg-audio",
+  enhanced_packet: "bg-msc-packet",
 }
 
 /** The MSC as a bar of 864 capacity units, one segment per subchannel. */
@@ -42,7 +42,7 @@ export function MscMap({
                   href={href("subchannels", String(s.id))}
                   aria-label={`Subchannel ${s.id}, ${s.name}`}
                   className={cn(
-                    "absolute inset-y-0 border-r border-background transition-colors",
+                    "absolute inset-y-0 border-r border-background transition-[filter,opacity] hover:brightness-110",
                     TYPE_CLASSES[s.type],
                     selected !== undefined &&
                       s.id !== selected &&

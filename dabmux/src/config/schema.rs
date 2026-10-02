@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     number, service_name, Component, EdiOutputConfig, EnsembleConfig, InputConfig, InputTiming,
@@ -24,48 +24,59 @@ pub const DEFAULT_PREBUFFER_FRAMES: usize = 4;
 /// Data service component type MOT (TS 101 756 table 2b), used by SPI and slideshow.
 pub const DSCTY_MOT: u8 = 60;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub ensemble: EnsembleConfig,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Defaults::is_empty")]
     pub defaults: Defaults,
     /// Subchannels shared by several components, by configuration-local name.
     #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub subchannels: BTreeMap<String, SubchannelConfig>,
     pub services: Vec<ServiceConfig>,
     /// Services carried only in other ensembles (FIG 0/24 with OE = 1).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub other_services: Vec<OtherService>,
     /// Frequency information (FIG 0/21).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub frequencies: Vec<FrequencyInformation>,
     /// Advance information about service changes (FIG 0/20).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub service_changes: Vec<ServiceChange>,
     pub output: EdiOutputConfig,
 }
 
 /// Settings applied wherever a subchannel or input leaves them unset.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protection: Option<ProtectionConfig>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "EdiDefaults::is_empty")]
     pub edi: EdiDefaults,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EdiDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub buffer_frames: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prebuffer_frames: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<InputTiming>,
     /// Applies to TCP inputs only; UDP inputs cannot be throttled.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub backpressure: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     /// 16 bits for programme services; data services use the 32-bit form
@@ -74,8 +85,10 @@ pub struct ServiceConfig {
     pub id: u32,
     /// ECC of a programme service from another country (FIG 0/9 extended field).
     #[serde(default, deserialize_with = "number::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ecc: Option<u8>,
     pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub short_label: Option<String>,
     #[serde(default, deserialize_with = "number::deserialize")]
     pub pty: u8,
@@ -85,66 +98,85 @@ pub struct ServiceConfig {
     pub components: Vec<ComponentConfig>,
     /// Linkage sets with this service as the key service (FIG 0/6).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub linking: Vec<LinkageSet>,
     /// Other ensembles that also carry this service (FIG 0/24).
     #[serde(default, deserialize_with = "number::list")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub other_ensembles: Vec<u16>,
 }
 
 /// A component either defines its own subchannel (`type`, `bitrate`, `input`
 /// and optionally `protection` and `subchannel_id`) or references a shared
 /// one by name, never both.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subchannel: Option<String>,
     #[serde(default, deserialize_with = "number::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subchannel_id: Option<u8>,
     #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<SubchannelKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protection: Option<ProtectionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<InputSpec>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub user_applications: Vec<UserApplication>,
     /// Packet mode only: the address of this component's packets, which must
     /// match the packets in the input.
     #[serde(default, deserialize_with = "number::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub packet_address: Option<u16>,
     /// Packet mode only: data service component type; MOT (60) for `spi`
     /// and `slideshow`.
     #[serde(default, deserialize_with = "number::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dscty: Option<u8>,
     /// Packet mode only: whether MSC data groups are used (default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_groups: Option<bool>,
 }
 
 /// A shared subchannel. `id` is the transmitted SubChId, allocated when unset.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubchannelConfig {
     #[serde(default, deserialize_with = "number::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u8>,
     #[serde(rename = "type")]
     pub kind: SubchannelKind,
     pub bitrate: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protection: Option<ProtectionConfig>,
     pub input: InputSpec,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "protocol", deny_unknown_fields)]
 pub enum InputSpec {
     Edi {
         uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
         stream_index: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         buffer_frames: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         prebuffer_frames: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         timing: Option<InputTiming>,
         /// TCP only, on by default: stop reading while the buffer is full so
         /// the producer is throttled, which unpaced file encoders need. Set
         /// `false` for live encoders to drop the oldest frame instead, so that
         /// clock drift cannot grow latency without bound.
+        #[serde(skip_serializing_if = "Option::is_none")]
         backpressure: Option<bool>,
     },
     Sti {
@@ -155,6 +187,18 @@ pub enum InputSpec {
     File {
         path: PathBuf,
     },
+}
+
+impl Defaults {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl EdiDefaults {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl ComponentConfig {

@@ -202,7 +202,7 @@ export function localTimeOffset(ensemble: Ensemble): string {
 }
 
 // TS 101 756 V2.5.1, table 12 (international table 1, all except North America).
-const PTY_TABLE_1 = [
+export const PTY_TABLE_1 = [
   "None", "News", "Current Affairs", "Information", "Sport", "Education",
   "Drama", "Arts", "Science", "Talk", "Pop Music", "Rock Music",
   "Easy Listening", "Light Classical", "Classical Music", "Other Music",
@@ -217,7 +217,7 @@ export function ptyLabel(pty: number, internationalTable: number): string {
 }
 
 // TS 101 756 V2.5.1, tables 9 and 10.
-const LANGUAGES: Record<number, string> = {
+export const LANGUAGES: Record<number, string> = {
   0x00: "Unknown", 0x01: "Albanian", 0x02: "Breton", 0x03: "Catalan",
   0x04: "Croatian", 0x05: "Welsh", 0x06: "Czech", 0x07: "Danish",
   0x08: "German", 0x09: "English", 0x0a: "Spanish", 0x0b: "Esperanto",

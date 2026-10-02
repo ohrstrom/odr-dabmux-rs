@@ -29,10 +29,10 @@ impl App {
             .map(config::resolve_path)
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("--config is required"))?;
-        let initial_config = config::load_from_file(&config_path)?;
+        let (source, initial_config) = config::load_from_file(&config_path)?;
 
         let state = AppState {
-            config: SharedConfig::new(initial_config),
+            config: SharedConfig::new(source, initial_config),
             stats: Arc::new(RuntimeStats::default()),
         };
 

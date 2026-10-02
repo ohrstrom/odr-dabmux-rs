@@ -1,4 +1,10 @@
-import { ArrowLeftIcon } from "@phosphor-icons/react"
+import * as React from "react"
+import {
+  ArrowLeftIcon,
+  PencilSimpleIcon,
+  PlusIcon,
+  TrashIcon,
+} from "@phosphor-icons/react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -17,6 +23,8 @@ import {
   PageHeader,
   Section,
 } from "@/components/fields"
+import { ServiceDeleteDialog } from "@/components/service-delete"
+import { ServiceFormDialog } from "@/components/service-form"
 import { LinkageSetTable } from "@/components/service-following"
 import {
   SUBCHANNEL_TYPES,
@@ -109,12 +117,35 @@ export function ServicesTable({ config }: { config: ResolvedConfig }) {
   )
 }
 
-export function ServicesPage({ config }: { config: ResolvedConfig }) {
+export function ServicesPage({
+  config,
+  onChanged,
+}: {
+  config: ResolvedConfig
+  /** Called after an edit, to reload the configuration. */
+  onChanged: () => void
+}) {
+  const [adding, setAdding] = React.useState(false)
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="Services"
         description={`${config.services.length} services in ${config.ensemble.label}`}
+      >
+        <Button size="sm" onClick={() => setAdding(true)}>
+          <PlusIcon data-icon="inline-start" />
+          Add service
+        </Button>
+      </PageHeader>
+      <ServiceFormDialog
+        config={config}
+        open={adding}
+        onOpenChange={setAdding}
+        onSaved={(service) => {
+          onChanged()
+          window.location.hash = href("services", sid(service.id))
+        }}
       />
       <Section title="All services" flush>
         <ServicesTable config={config} />
@@ -126,11 +157,15 @@ export function ServicesPage({ config }: { config: ResolvedConfig }) {
 export function ServiceDetail({
   config,
   service,
+  onChanged,
 }: {
   config: ResolvedConfig
   service: Service
+  onChanged: () => void
 }) {
   const { ensemble } = config
+  const [editing, setEditing] = React.useState(false)
+  const [deleting, setDeleting] = React.useState(false)
   const subchannels = new Map(config.subchannels.map((s) => [s.name, s]))
   const ecc = service.ecc ?? ensemble.ecc
 
@@ -145,16 +180,47 @@ export function ServiceDetail({
         }
         description={`SId ${sid(service.id)}`}
       >
-        <Button
-          variant="outline"
-          size="sm"
-          nativeButton={false}
-          render={<a href={href("services")} />}
-        >
-          <ArrowLeftIcon data-icon="inline-start" />
-          All services
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            nativeButton={false}
+            render={<a href={href("services")} />}
+          >
+            <ArrowLeftIcon data-icon="inline-start" />
+            All services
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+            <PencilSimpleIcon data-icon="inline-start" />
+            Edit
+          </Button>
+          <Button variant="destructive" size="sm" onClick={() => setDeleting(true)}>
+            <TrashIcon data-icon="inline-start" />
+            Delete
+          </Button>
+        </div>
       </PageHeader>
+      <ServiceFormDialog
+        config={config}
+        sid={serviceKey(service)}
+        open={editing}
+        onOpenChange={setEditing}
+        onSaved={(saved) => {
+          onChanged()
+          if (saved.id !== service.id) {
+            window.location.hash = href("services", sid(saved.id))
+          }
+        }}
+      />
+      <ServiceDeleteDialog
+        service={service}
+        open={deleting}
+        onOpenChange={setDeleting}
+        onDeleted={() => {
+          onChanged()
+          window.location.hash = href("services")
+        }}
+      />
 
       <Section title="Service">
         <Fields>

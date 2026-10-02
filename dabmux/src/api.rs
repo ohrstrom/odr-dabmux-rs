@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::app::AppState;
 
 mod stats;
+mod ui;
 
 async fn push_config(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -19,9 +20,9 @@ async fn push_config(
         Err(err) => Err(err),
     };
     match result {
-        Ok(changed) => (
+        Ok(applied) => (
             StatusCode::OK,
-            Json(serde_json::json!({"changed": changed})),
+            Json(serde_json::json!({"changed": applied.changed})),
         )
             .into_response(),
         Err(err) => (
@@ -61,5 +62,6 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(stats::get_stats))
         .route("/config", post(push_config))
         .route("/config/resolved", get(resolved_config))
+        .nest("/ui", ui::router())
         .fallback(api_404_handler)
 }

@@ -19,6 +19,7 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { AppSidebar, PAGES, type Page } from "@/components/app-sidebar"
 import { EmptyState } from "@/components/fields"
@@ -76,7 +77,12 @@ function App() {
             </Alert>
           )}
           {config ? (
-            <Content config={config} page={page} route={route} />
+            <Content
+              config={config}
+              page={page}
+              route={route}
+              onChanged={refresh}
+            />
           ) : loading ? (
             <Loading />
           ) : null}
@@ -90,17 +96,19 @@ function Content({
   config,
   page,
   route,
+  onChanged,
 }: {
   config: ResolvedConfig
   page: Page
   route: string[]
+  onChanged: () => void
 }) {
   switch (page) {
     case "services": {
-      if (!route[1]) return <ServicesPage config={config} />
+      if (!route[1]) return <ServicesPage config={config} onChanged={onChanged} />
       const service = config.services.find((s) => serviceKey(s) === route[1])
       return service ? (
-        <ServiceDetail config={config} service={service} />
+        <ServiceDetail config={config} service={service} onChanged={onChanged} />
       ) : (
         <EmptyState>
           No service {route[1]} in the running configuration.{" "}
@@ -122,7 +130,7 @@ function Content({
     case "output":
       return <OutputPage config={config} />
     default:
-      return <Overview config={config} />
+      return <Overview config={config} onChanged={onChanged} />
   }
 }
 
@@ -215,6 +223,7 @@ createRoot(document.getElementById("root")!).render(
     <ThemeProvider>
       <TooltipProvider>
         <App />
+        <Toaster position="bottom-right" />
       </TooltipProvider>
     </ThemeProvider>
   </React.StrictMode>

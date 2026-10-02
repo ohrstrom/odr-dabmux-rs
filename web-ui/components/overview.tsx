@@ -1,4 +1,8 @@
+import * as React from "react"
+import { PencilSimpleIcon } from "@phosphor-icons/react"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { EnsembleFormDialog } from "@/components/ensemble-form"
 import {
   Field,
   Fields,
@@ -18,8 +22,16 @@ import {
   type ResolvedConfig,
 } from "@/lib/config"
 
-export function Overview({ config }: { config: ResolvedConfig }) {
+export function Overview({
+  config,
+  onChanged,
+}: {
+  config: ResolvedConfig
+  /** Called after an edit, to reload the configuration. */
+  onChanged: () => void
+}) {
   const { ensemble, services, subchannels } = config
+  const [editing, setEditing] = React.useState(false)
   const usedCu = subchannels.reduce((sum, s) => sum + s.size_cu, 0)
   const bitrate = subchannels.reduce((sum, s) => sum + s.bitrate, 0)
   const data = services.filter((s) => s.data).length
@@ -35,6 +47,16 @@ export function Overview({ config }: { config: ResolvedConfig }) {
             transmission mode {ensemble.mode}
           </>
         }
+      >
+        <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+          <PencilSimpleIcon data-icon="inline-start" />
+          Edit ensemble
+        </Button>
+      </PageHeader>
+      <EnsembleFormDialog
+        open={editing}
+        onOpenChange={setEditing}
+        onSaved={onChanged}
       />
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
