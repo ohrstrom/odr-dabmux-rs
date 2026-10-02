@@ -3,6 +3,7 @@ import {
   BroadcastIcon,
   ExportIcon,
   LinkSimpleIcon,
+  PulseIcon,
   RadioIcon,
   SquaresFourIcon,
   StackIcon,
@@ -33,6 +34,7 @@ export type Page =
   | "subchannels"
   | "service-following"
   | "output"
+  | "live"
 
 export const PAGES: Record<
   Page,
@@ -43,6 +45,7 @@ export const PAGES: Record<
   subchannels: { title: "Subchannels", icon: StackIcon },
   "service-following": { title: "Service following", icon: LinkSimpleIcon },
   output: { title: "Output", icon: ExportIcon },
+  live: { title: "Live", icon: PulseIcon },
 }
 
 export function AppSidebar({

@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::app::AppState;
 
+mod live;
 mod stats;
 mod ui;
 

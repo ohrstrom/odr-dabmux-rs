@@ -8,6 +8,9 @@
 @theme inline {
     --font-heading: var(--font-mono);
     --font-mono: 'JetBrains Mono Variable', monospace;
+    --color-status-good: var(--status-good);
+    --color-status-warning: var(--status-warning);
+    --color-status-critical: var(--status-critical);
     --color-msc-dab-plus: var(--msc-dab-plus);
     --color-msc-mpeg-audio: var(--msc-mpeg-audio);
     --color-msc-packet: var(--msc-packet);
@@ -87,6 +90,9 @@
     --msc-dab-plus: oklch(0.55 0.19 258);
     --msc-mpeg-audio: oklch(0.7 0.16 65);
     --msc-packet: oklch(0.62 0.13 165);
+    --status-good: #0ca30c;
+    --status-warning: #fab219;
+    --status-critical: #d03b3b;
 }
 
 .dark {

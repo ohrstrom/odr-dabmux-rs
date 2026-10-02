@@ -60,7 +60,6 @@ fn catch_up(lag: Duration) -> CatchUp {
     }
 }
 
-#[derive(Default)]
 pub struct RuntimeStats {
     pub generated_frames: AtomicU64,
     pub config_activations: AtomicU64,
@@ -76,6 +75,75 @@ pub struct RuntimeStats {
     pub invalid_timestamps: AtomicU64,
     pub frame_errors: AtomicU64,
     pub clock_drift_ms: AtomicI64,
+    /// The latest frame, for live monitoring; published only while
+    /// someone subscribes.
+    pub live: watch::Sender<Option<Arc<LiveFrame>>>,
+}
+
+impl Default for RuntimeStats {
+    fn default() -> Self {
+        Self {
+            generated_frames: AtomicU64::default(),
+            config_activations: AtomicU64::default(),
+            input_underflows: AtomicU64::default(),
+            input_drops: AtomicU64::default(),
+            input_size_mismatches: AtomicU64::default(),
+            decode_errors: AtomicU64::default(),
+            send_errors: AtomicU64::default(),
+            missed_ticks: AtomicU64::default(),
+            catch_up_frames: AtomicU64::default(),
+            buffered_input_frames: AtomicU64::default(),
+            late_input_frames: AtomicU64::default(),
+            invalid_timestamps: AtomicU64::default(),
+            frame_errors: AtomicU64::default(),
+            clock_drift_ms: AtomicI64::default(),
+            live: watch::Sender::new(None),
+        }
+    }
+}
+
+/// The state of the mux at one frame.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveFrame {
+    /// Frames generated since startup.
+    pub frame: u64,
+    /// The frame's time, in milliseconds since the Unix epoch.
+    pub unix_ms: i64,
+    pub subchannels: Vec<LiveSubchannel>,
+    pub outputs: Vec<LiveOutput>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveSubchannel {
+    pub name: String,
+    pub id: u8,
+    pub state: InputState,
+    /// Frames waiting in the input buffer; none for a packet file.
+    pub buffered: usize,
+    pub capacity: usize,
+    /// Frames without input data since the input was set up.
+    pub underflows: u64,
+    /// Frames dropped because the input ran ahead of real time.
+    pub drops: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputState {
+    Receiving,
+    /// Filling the buffer before playing out.
+    Prebuffering,
+    /// No data; silence or padding is sent instead.
+    Underflow,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveOutput {
+    pub protocol: &'static str,
+    /// TCP: the listening port; UDP: the destination.
+    pub endpoint: String,
+    /// Connected TCP clients.
+    pub clients: Option<usize>,
 }
 
 impl RuntimeStats {
@@ -455,6 +523,8 @@ struct InputHandle {
     source: InputSource,
     underflowing: bool,
     reported_drops: u64,
+    /// Frames without data, for live monitoring.
+    underflows: u64,
 }
 
 enum InputSource {
@@ -660,6 +730,7 @@ fn start_packet_input(
         }),
         underflowing: false,
         reported_drops: 0,
+        underflows: 0,
     }
 }
 
@@ -729,6 +800,74 @@ impl TcpOutputHandle {
 impl Drop for TcpOutputHandle {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+fn live_frame(
+    active: &ValidatedConfig,
+    clock: FrameClock,
+    receivers: &[InputHandle],
+    tcp_outputs: &[TcpOutputHandle],
+    udp_destinations: &[String],
+    frame: u64,
+) -> LiveFrame {
+    let subchannels = active
+        .subchannels
+        .iter()
+        .zip(receivers)
+        .map(|(sub, input)| {
+            let (buffered, capacity, prebuffering, drops) = match &input.source {
+                InputSource::Network(network) => (
+                    network.buffered.queue.len(),
+                    network.buffered.max_frames,
+                    network.buffered.prebuffering,
+                    network.buffered.overflow_drops,
+                ),
+                InputSource::Packets(_) => (0, 0, false, 0),
+            };
+            let state = if input.underflowing {
+                InputState::Underflow
+            } else if prebuffering {
+                InputState::Prebuffering
+            } else {
+                InputState::Receiving
+            };
+            LiveSubchannel {
+                name: sub.name.clone(),
+                id: sub.id,
+                state,
+                buffered,
+                capacity,
+                underflows: input.underflows,
+                drops,
+            }
+        })
+        .collect();
+    let outputs = tcp_outputs
+        .iter()
+        .map(|output| LiveOutput {
+            protocol: "tcp",
+            endpoint: output.port.to_string(),
+            clients: Some(
+                output
+                    .state
+                    .lock()
+                    .expect("TCP output state poisoned")
+                    .clients
+                    .len(),
+            ),
+        })
+        .chain(udp_destinations.iter().map(|destination| LiveOutput {
+            protocol: "udp",
+            endpoint: destination.clone(),
+            clients: None,
+        }))
+        .collect();
+    LiveFrame {
+        frame,
+        unix_ms: clock.unix_seconds * 1000 + i64::from(clock.millisecond),
+        subchannels,
+        outputs,
     }
 }
 
@@ -913,6 +1052,7 @@ fn start_input(
         }),
         underflowing: false,
         reported_drops: 0,
+        underflows: 0,
     }
 }
 
@@ -1345,6 +1485,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                     substitute,
                 } => {
                     stats.input_underflows.fetch_add(1, Ordering::Relaxed);
+                    input.underflows += 1;
                     if !input.underflowing {
                         let substitute_kind = match input.source {
                             InputSource::Network(_) => "silence",
@@ -1357,6 +1498,17 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 }
             };
             payloads.push(data);
+        }
+        if stats.live.receiver_count() > 0 {
+            let frame = live_frame(
+                &active,
+                clock,
+                &receivers,
+                &tcp_outputs,
+                &udp_destinations,
+                stats.generated_frames.load(Ordering::Relaxed),
+            );
+            stats.live.send_replace(Some(Arc::new(frame)));
         }
         stats.buffered_input_frames.store(
             receivers

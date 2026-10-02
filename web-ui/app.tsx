@@ -24,6 +24,7 @@ import { TooltipProvider } from "@/components/ui/tooltip"
 import { AppSidebar, PAGES, type Page } from "@/components/app-sidebar"
 import { EmptyState } from "@/components/fields"
 import { ModeToggle } from "@/components/mode-toggle"
+import { LivePage } from "@/components/live"
 import { OutputPage } from "@/components/output"
 import { Overview } from "@/components/overview"
 import { ServiceDetail, ServicesPage } from "@/components/services"
@@ -84,6 +85,7 @@ function App() {
           {config ? (
             <Content
               config={config}
+              running={running ?? config}
               page={page}
               route={route}
               onChanged={refresh}
@@ -103,8 +105,11 @@ function Content({
   page,
   route,
   onChanged,
+  running,
 }: {
   config: ResolvedConfig
+  /** Without pending changes. */
+  running: ResolvedConfig
   page: Page
   route: string[]
   onChanged: () => void
@@ -137,6 +142,8 @@ function Content({
       return <ServiceFollowingPage config={config} />
     case "output":
       return <OutputPage config={config} />
+    case "live":
+      return <LivePage config={running} />
     default:
       return <Overview config={config} onChanged={onChanged} />
   }

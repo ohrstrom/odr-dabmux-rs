@@ -300,6 +300,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "futures-util",
  "log",
  "notify",
  "reqwest",

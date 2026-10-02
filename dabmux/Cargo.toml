@@ -7,6 +7,7 @@ description = "DAB multiplexer"
 [dependencies]
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal", "fs"] }
 axum = "0.7"
+futures-util = { version = "0.3", default-features = false }
 tower-http = { version = "0.5", features = ["normalize-path"] }
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"

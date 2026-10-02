@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/config", get(get_config).put(replace_config))
         .route("/config/preview", post(preview_config))
         .route("/config/save", post(save_config))
+        .route("/stats/stream", get(super::live::stream))
         .route(
             "/ensemble",
             get(get_ensemble)
