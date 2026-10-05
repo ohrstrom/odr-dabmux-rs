@@ -219,6 +219,28 @@ pub struct TimedPayload {
     pub tsta: Option<u32>,
     pub stream_index: u16,
     pub bytes: Vec<u8>,
+    /// Peak levels the audio encoder sent along (ODR-AudioEnc's `ODRa` tag).
+    pub audio_levels: Option<AudioLevels>,
+}
+
+/// Peak audio levels of one frame, as linear 16-bit PCM magnitudes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLevels {
+    pub left: i16,
+    pub right: i16,
+}
+
+impl AudioLevels {
+    /// The `ODRa` TAG: left and right peak, each a big-endian `i16`. Not an
+    /// ETSI tag; ODR-AudioEnc sends it and ODR-DabMux reads it the same way.
+    fn decode(packet: &AfPacket) -> Option<Self> {
+        let tag = packet.tags.iter().find(|tag| tag.name == *b"ODRa")?;
+        let [l0, l1, r0, r1] = tag.value[..].try_into().ok()?;
+        Some(Self {
+            left: i16::from_be_bytes([l0, l1]),
+            right: i16::from_be_bytes([r0, r1]),
+        })
+    }
 }
 
 pub fn decode_sti_payload(packet: &AfPacket, stream_index: u16) -> Result<TimedPayload> {
@@ -286,6 +308,7 @@ pub fn decode_sti_payload(packet: &AfPacket, stream_index: u16) -> Result<TimedP
         tsta,
         stream_index,
         bytes: tag.value[3..].to_vec(),
+        audio_levels: AudioLevels::decode(packet),
     })
 }
 
@@ -341,6 +364,7 @@ pub fn decode_sti_rtp(data: &[u8]) -> Result<TimedPayload> {
         tsta: None,
         stream_index: 1,
         bytes: data[at..at + payload_len].to_vec(),
+        audio_levels: None,
     })
 }
 
@@ -420,6 +444,40 @@ impl PftReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sti_payload_carries_odr_audio_levels() {
+        let mut packet = AfPacket {
+            sequence: 1,
+            tags: vec![
+                pointer_tag(*b"DSTI"),
+                Tag {
+                    name: *b"dsti",
+                    value: vec![0, 1],
+                },
+                Tag {
+                    name: [b's', b's', 0, 1],
+                    value: vec![0, 0, 0, 1, 2, 3],
+                },
+            ],
+        };
+        assert_eq!(decode_sti_payload(&packet, 1).unwrap().audio_levels, None);
+        packet.tags.push(Tag {
+            name: *b"ODRa",
+            value: vec![0x7f, 0xff, 0x01, 0x00],
+        });
+        assert_eq!(
+            decode_sti_payload(&packet, 1).unwrap().audio_levels,
+            Some(AudioLevels {
+                left: i16::MAX,
+                right: 256
+            })
+        );
+        packet.tags.last_mut().unwrap().value.pop();
+        let payload = decode_sti_payload(&packet, 1).unwrap();
+        assert_eq!(payload.audio_levels, None, "a short tag is ignored");
+        assert_eq!(payload.bytes, vec![1, 2, 3]);
+    }
 
     #[test]
     fn af_round_trip_and_crc_rejection() {

@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/tooltip"
 import { EmptyState, None, PageHeader, Section, Stat } from "@/components/fields"
 import { SelectField } from "@/components/form-fields"
+import { LevelMeter } from "@/components/level-meter"
 import { serviceKey, subchannelUsers, type ResolvedConfig } from "@/lib/config"
 import { href } from "@/hooks/use-route"
 import {
@@ -128,6 +129,13 @@ export function LivePage({ config }: { config: ResolvedConfig }) {
         flush
       >
         <InputsTable config={config} live={live} />
+      </Section>
+
+      <Section
+        title="Audio levels"
+        description="Peak levels the encoders send with the audio, as on air"
+      >
+        <AudioLevels config={config} live={live} />
       </Section>
 
       <div className="grid gap-6 xl:grid-cols-2">
@@ -276,6 +284,55 @@ function InputsTable({ config, live }: { config: ResolvedConfig; live: LiveStats
         })}
       </TableBody>
     </Table>
+  )
+}
+
+const SILENCE_DB = -90
+
+function AudioLevels({ config, live }: { config: ResolvedConfig; live: LiveStats }) {
+  const { sample } = live
+  if (!sample) return <EmptyState>Waiting for the first frame…</EmptyState>
+  const users = subchannelUsers(config)
+  const audio = sample.subchannels.filter((sub) => {
+    const type = config.subchannels.find((s) => s.name === sub.name)?.type
+    return type === "dab_plus" || type === "mpeg_audio"
+  })
+  if (audio.length === 0) return <EmptyState>No audio subchannels.</EmptyState>
+
+  return (
+    <div className="grid gap-x-8 gap-y-5 md:grid-cols-2 xl:grid-cols-4">
+      {audio.map((sub) => {
+        const services = users.get(sub.name) ?? []
+        return (
+          <div key={sub.name} className="min-w-0 space-y-1.5">
+            <div className="flex items-baseline justify-between gap-3 text-xs">
+              <span className="min-w-0 truncate">
+                <span className="font-medium">
+                  {services.map((s) => s.label).join(", ") || sub.name}
+                </span>
+                <span className="ml-2 text-muted-foreground">
+                  SubChId {sub.id}
+                </span>
+              </span>
+              {!sub.audio && (
+                <span className="shrink-0 text-muted-foreground">
+                  {sub.state === "receiving"
+                    ? "no levels from the encoder"
+                    : STATES[sub.state].label.toLowerCase()}
+                </span>
+              )}
+            </div>
+            <LevelMeter
+              levels={
+                sub.audio
+                  ? [sub.audio.left_db, sub.audio.right_db]
+                  : [SILENCE_DB, SILENCE_DB]
+              }
+            />
+          </div>
+        )
+      })}
+    </div>
   )
 }
 

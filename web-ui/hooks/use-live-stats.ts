@@ -33,7 +33,12 @@ export type LiveSubchannel = {
   buffered_max: number
   underflows: number
   drops: number
+  /** Peak over the interval, from the encoder; null when it sends none. */
+  audio: AudioPeak | null
 }
+
+/** dBFS; −90 for digital silence. */
+export type AudioPeak = { left_db: number; right_db: number }
 
 export type LiveOutput = {
   protocol: "tcp" | "udp"

@@ -1,14 +1,14 @@
-# Written by dabmux on 2026-10-02 18:05:16 UTC. Comments are not kept; the previous
+# Written by dabmux on 2026-10-02 19:43:47 UTC. Comments are not kept; the previous
 # file, with its comments, is config.web-ui.example.yaml.bak.
 
 ensemble:
   id: 0x4fff
   ecc: 0xe1
-  label: Foo The Bar
-  short_label: FTB
+  label: Foo The Bar!!?
+  short_label: FTBr?
   local_time_offset_half_hours: 2
   local_time_offset_auto: false
-  international_table: 0
+  international_table: 1
   mode: 1
   tist: true
   tist_offset_ms: 0
@@ -59,10 +59,93 @@ services:
       uri: tcp://127.0.0.1:9003
     user_applications:
     - slideshow
+- id: 0x4d04
+  label: Program 4
+  short_label: P4
+  pty: 7
+  language: 12
+  components:
+  - subchannel_id: 4
+    type: dab_plus
+    bitrate: 88
+    protection:
+      profile: eep_a
+      level: 3
+    input:
+      protocol: edi
+      uri: tcp://127.0.0.1:9004
+    user_applications:
+    - slideshow
+- id: 0x4d05
+  label: Radio News
+  short_label: News
+  pty: 1
+  language: 8
+  components:
+  - subchannel_id: 5
+    type: dab_plus
+    bitrate: 64
+    input:
+      protocol: edi
+      uri: tcp://127.0.0.1:9005
+    user_applications:
+    - slideshow
+- id: 0x4d06
+  label: Pop Hits
+  short_label: Pop
+  pty: 10
+  language: 9
+  components:
+  - subchannel_id: 6
+    type: dab_plus
+    bitrate: 56
+    input:
+      protocol: edi
+      uri: tcp://127.0.0.1:9006
+    user_applications:
+    - slideshow
+- id: 0x4d07
+  label: Talk Radio
+  short_label: Talk
+  pty: 9
+  language: 15
+  components:
+  - subchannel_id: 7
+    type: dab_plus
+    bitrate: 48
+    protection:
+      profile: eep_a
+      level: 4
+    input:
+      protocol: edi
+      uri: tcp://127.0.0.1:9007
+    user_applications:
+    - slideshow
+- id: 0x4d08
+  label: Program 8
+  short_label: P8
+  pty: 8
+  language: 5
+  components:
+  - subchannel_id: 8
+    type: dab_plus
+    bitrate: 48
+    protection:
+      profile: eep_a
+      level: 3
+    input:
+      protocol: edi
+      uri: tcp://127.0.0.1:9008
+    user_applications:
+    - slideshow
 output:
   destinations:
   - protocol: tcp
     listen_port: 8999
+    max_frames_queued: 500
+    preroll_ms: 0
+  - protocol: tcp
+    listen_port: 8998
     max_frames_queued: 500
     preroll_ms: 0
   tagpacket_alignment: 8

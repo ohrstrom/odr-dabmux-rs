@@ -3,7 +3,8 @@
 //! Each client follows every frame and sends one event per interval
 //! (`?interval_ms=`, default 250 ms, at least one frame of 24 ms). Buffer
 //! levels come with their minimum and maximum over the interval, so that
-//! brief underruns between two events still show.
+//! brief underruns between two events still show, and audio levels with
+//! their peak over the interval.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -20,11 +21,15 @@ use tokio::sync::watch;
 use tokio::time::{interval, Interval, MissedTickBehavior};
 
 use crate::app::AppState;
-use crate::runtime::{LiveFrame, LiveOutput, LiveSubchannel, RuntimeStats, StatsSnapshot};
+use crate::runtime::{
+    LiveAudio, LiveFrame, LiveOutput, LiveSubchannel, RuntimeStats, StatsSnapshot,
+};
 use dabmux::frame::FRAME_PERIOD_MS;
 
 const DEFAULT_INTERVAL_MS: u64 = 250;
 const MAX_INTERVAL_MS: u64 = 10_000;
+/// What ODR-DabMux reports for a peak of zero.
+const SILENCE_DB: f64 = -90.0;
 
 #[derive(Deserialize)]
 pub struct StreamOptions {
@@ -70,6 +75,32 @@ struct SubchannelSample {
     latest: LiveSubchannel,
     buffered_min: usize,
     buffered_max: usize,
+    /// Audio peak over the interval; none when the encoder sends no levels.
+    audio: Option<AudioPeak>,
+}
+
+/// Peak levels in dBFS, to one decimal.
+#[derive(Serialize)]
+struct AudioPeak {
+    left_db: f64,
+    right_db: f64,
+}
+
+impl From<LiveAudio> for AudioPeak {
+    fn from(peak: LiveAudio) -> Self {
+        Self {
+            left_db: dbfs(peak.left),
+            right_db: dbfs(peak.right),
+        }
+    }
+}
+
+fn dbfs(peak: i16) -> f64 {
+    if peak <= 0 {
+        return SILENCE_DB;
+    }
+    let db = 20.0 * (f64::from(peak) / f64::from(i16::MAX)).log10();
+    ((db * 10.0).round() / 10.0).max(SILENCE_DB)
 }
 
 struct Monitor {
@@ -82,6 +113,8 @@ struct Monitor {
     since: Instant,
     /// Buffer extremes per subchannel name since the last event.
     extremes: HashMap<String, (usize, usize)>,
+    /// Audio peaks per subchannel name since the last event.
+    peaks: HashMap<String, LiveAudio>,
 }
 
 impl Monitor {
@@ -98,6 +131,7 @@ impl Monitor {
             seen: 0,
             since: Instant::now(),
             extremes: HashMap::new(),
+            peaks: HashMap::new(),
         }
     }
 
@@ -130,6 +164,15 @@ impl Monitor {
                     *max = (*max).max(sub.buffered);
                 })
                 .or_insert((sub.buffered, sub.buffered));
+            if let Some(audio) = sub.audio {
+                self.peaks
+                    .entry(sub.name.clone())
+                    .and_modify(|peak| {
+                        peak.left = peak.left.max(audio.left);
+                        peak.right = peak.right.max(audio.right);
+                    })
+                    .or_insert(audio);
+            }
         }
         self.seen += 1;
         self.latest = Some(frame);
@@ -161,6 +204,7 @@ impl Monitor {
                     latest: sub.clone(),
                     buffered_min: min,
                     buffered_max: max,
+                    audio: self.peaks.get(&sub.name).copied().map(AudioPeak::from),
                 }
             })
             .collect();
@@ -178,6 +222,7 @@ impl Monitor {
             outputs: frame.outputs.clone(),
         };
         self.extremes.clear();
+        self.peaks.clear();
         Some(sample)
     }
 }
@@ -188,6 +233,10 @@ mod tests {
     use crate::runtime::InputState;
 
     fn frame(frame: u64, buffered: usize) -> Arc<LiveFrame> {
+        with_audio(frame, buffered, None)
+    }
+
+    fn with_audio(frame: u64, buffered: usize, audio: Option<(i16, i16)>) -> Arc<LiveFrame> {
         Arc::new(LiveFrame {
             frame,
             unix_ms: 0,
@@ -199,6 +248,7 @@ mod tests {
                 capacity: 40,
                 underflows: 0,
                 drops: 0,
+                audio: audio.map(|(left, right)| LiveAudio { left, right }),
             }],
             outputs: Vec::new(),
         })
@@ -230,5 +280,31 @@ mod tests {
         let second = sample(&mut monitor);
         assert_eq!(second["frames"], 1);
         assert_eq!(second["subchannels"][0]["buffered_min"], 11);
+    }
+
+    #[tokio::test]
+    async fn events_carry_the_audio_peak_over_the_interval() {
+        let mut monitor = Monitor::new(
+            Arc::new(RuntimeStats::default()),
+            Duration::from_millis(250),
+        );
+        monitor.record(frame(0, 10));
+        assert!(sample(&mut monitor)["subchannels"][0]["audio"].is_null());
+
+        for (n, levels) in [(3277, 0), (i16::MAX, 100), (1000, 32)]
+            .into_iter()
+            .enumerate()
+        {
+            monitor.record(with_audio(n as u64, 10, Some(levels)));
+        }
+        let audio = &sample(&mut monitor)["subchannels"][0]["audio"];
+        assert_eq!(audio["left_db"], 0.0);
+        assert_eq!(audio["right_db"], -50.3);
+        assert!(
+            sample(&mut monitor)["subchannels"][0]["audio"].is_null(),
+            "no levels in the new interval"
+        );
+        assert_eq!(dbfs(0), SILENCE_DB);
+        assert_eq!(dbfs(3277), -20.0);
     }
 }

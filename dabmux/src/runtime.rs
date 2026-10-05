@@ -17,7 +17,7 @@ use crate::config::{
 use crate::fic::FicCarousel;
 use crate::timing::{TaiClock, TaiSource};
 use dabmux::edi::{
-    decode_sti_payload, decode_sti_rtp, fragment_af, pointer_tag, AfPacket, Deti, Est,
+    decode_sti_payload, decode_sti_rtp, fragment_af, pointer_tag, AfPacket, AudioLevels, Deti, Est,
     PftReassembler, TimedPayload,
 };
 use dabmux::frame::{
@@ -125,6 +125,16 @@ pub struct LiveSubchannel {
     pub underflows: u64,
     /// Frames dropped because the input ran ahead of real time.
     pub drops: u64,
+    /// Peak levels the encoder sent with this frame.
+    #[serde(skip)]
+    pub audio: Option<LiveAudio>,
+}
+
+/// Peak levels of one frame, linear 16-bit PCM (0 to 32767).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LiveAudio {
+    pub left: i16,
+    pub right: i16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -197,6 +207,8 @@ struct BufferedInput {
     backpressure: bool,
     /// Frames discarded because the producer ran ahead of real time.
     overflow_drops: u64,
+    /// Audio levels of the frame played out last, if the encoder sent any.
+    levels: Option<AudioLevels>,
 }
 
 impl BufferedInput {
@@ -221,10 +233,17 @@ impl BufferedInput {
             timing,
             backpressure: input.backpressure(),
             overflow_drops: 0,
+            levels: None,
         }
     }
 
     fn take(&mut self, clock: FrameClock, stats: &RuntimeStats) -> Option<Vec<u8>> {
+        let payload = self.take_payload(clock, stats);
+        self.levels = payload.as_ref().and_then(|payload| payload.audio_levels);
+        payload.map(|payload| payload.bytes)
+    }
+
+    fn take_payload(&mut self, clock: FrameClock, stats: &RuntimeStats) -> Option<TimedPayload> {
         while !self.backpressure || self.queue.len() < self.max_frames {
             let Ok(payload) = self.rx.try_recv() else {
                 break;
@@ -265,7 +284,7 @@ impl BufferedInput {
                 }
                 self.prebuffering = false;
                 match self.queue.pop_front() {
-                    Some(payload) => Some(payload.bytes),
+                    Some(payload) => Some(payload),
                     None => {
                         self.prebuffering = true;
                         None
@@ -293,7 +312,7 @@ impl BufferedInput {
                         stats.late_input_frames.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    return self.queue.pop_front().map(|payload| payload.bytes);
+                    return self.queue.pop_front();
                 }
             }
         }
@@ -816,14 +835,15 @@ fn live_frame(
         .iter()
         .zip(receivers)
         .map(|(sub, input)| {
-            let (buffered, capacity, prebuffering, drops) = match &input.source {
+            let (buffered, capacity, prebuffering, drops, levels) = match &input.source {
                 InputSource::Network(network) => (
                     network.buffered.queue.len(),
                     network.buffered.max_frames,
                     network.buffered.prebuffering,
                     network.buffered.overflow_drops,
+                    network.buffered.levels,
                 ),
-                InputSource::Packets(_) => (0, 0, false, 0),
+                InputSource::Packets(_) => (0, 0, false, 0, None),
             };
             let state = if input.underflowing {
                 InputState::Underflow
@@ -840,6 +860,10 @@ fn live_frame(
                 capacity,
                 underflows: input.underflows,
                 drops,
+                audio: levels.map(|levels| LiveAudio {
+                    left: levels.left,
+                    right: levels.right,
+                }),
             }
         })
         .collect();
@@ -1609,6 +1633,7 @@ mod tests {
             tsta,
             stream_index: 1,
             bytes,
+            audio_levels: None,
         }
     }
 
@@ -1749,6 +1774,7 @@ mod tests {
             timing: InputTiming::Prebuffering,
             backpressure: false,
             overflow_drops: 0,
+            levels: None,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 0, 0).unwrap();
@@ -1763,6 +1789,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audio_levels_follow_the_frame_played_out() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut input = BufferedInput::new(
+            rx,
+            &InputConfig::Sti {
+                uri: "rtp://:9000".into(),
+            },
+        );
+        let stats = RuntimeStats::default();
+        let clock = FrameClock::new(0, 0, 0).unwrap();
+        for (byte, left) in [(1, 100), (2, 200)] {
+            let mut frame = payload(vec![byte], None, None);
+            frame.audio_levels = Some(AudioLevels { left, right: 0 });
+            tx.send(frame).await.unwrap();
+        }
+        assert_eq!(input.take(clock, &stats), Some(vec![1]));
+        assert_eq!(input.levels.map(|l| l.left), Some(100));
+        assert_eq!(input.take(clock, &stats), Some(vec![2]));
+        assert_eq!(input.levels.map(|l| l.left), Some(200));
+        assert_eq!(input.take(clock, &stats), None);
+        assert_eq!(input.levels, None, "no levels without audio on air");
+    }
+
+    #[tokio::test]
     async fn tcp_prebuffering_preserves_frames_when_encoder_runs_ahead() {
         let (tx, rx) = mpsc::channel(8);
         let mut input = BufferedInput {
@@ -1774,6 +1824,7 @@ mod tests {
             timing: InputTiming::Prebuffering,
             backpressure: true,
             overflow_drops: 0,
+            levels: None,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 0, 0).unwrap();
@@ -1798,6 +1849,7 @@ mod tests {
             timing: InputTiming::Prebuffering,
             backpressure: false,
             overflow_drops: 0,
+            levels: None,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 0, 0).unwrap();
@@ -1822,6 +1874,7 @@ mod tests {
             timing: InputTiming::Timestamped,
             backpressure: false,
             overflow_drops: 0,
+            levels: None,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 946_684_800, 48).unwrap();
@@ -1850,6 +1903,7 @@ mod tests {
             timing: InputTiming::Timestamped,
             backpressure: false,
             overflow_drops: 0,
+            levels: None,
         };
         let stats = RuntimeStats::default();
         let clock = FrameClock::new(0, 946_684_800, 48).unwrap();
