@@ -20,8 +20,45 @@ pub const FEC_PACKET_ADDRESS: u16 = dabmux::packet::FEC_ADDRESS;
 
 pub struct ConfigUpdate {
     pub candidate: ValidatedConfig,
-    pub reply: oneshot::Sender<anyhow::Result<bool>>,
+    pub reply: oneshot::Sender<anyhow::Result<Activation>>,
 }
+
+/// How the runtime takes on a new configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Activation {
+    /// Active from the next transmission frame.
+    Applied,
+    /// A multiplex reconfiguration, announced in the FIC and active from the
+    /// scheduled switch.
+    Scheduled(ScheduledSwitch),
+}
+
+/// When an announced multiplex reconfiguration takes effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScheduledSwitch {
+    /// System time at which the mux builds the first frame of the new
+    /// configuration. On air it is later by the TIST offset.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// CIF count (modulo 5000) of that frame, as in the EDI and ETI output.
+    pub cif_count: u16,
+}
+
+/// A change refused because an announced reconfiguration is still pending.
+#[derive(Debug)]
+pub struct SwitchPending(pub ScheduledSwitch);
+
+impl std::fmt::Display for SwitchPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a multiplex reconfiguration is scheduled for {} (CIF {}); change the configuration after it",
+            self.0.at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            self.0.cif_count
+        )
+    }
+}
+
+impl std::error::Error for SwitchPending {}
 
 #[derive(Clone)]
 pub struct SharedConfig {
@@ -30,6 +67,8 @@ pub struct SharedConfig {
     source: Arc<RwLock<Revision>>,
     updates: Arc<Mutex<Option<mpsc::Sender<ConfigUpdate>>>>,
     update_lock: Arc<Mutex<()>>,
+    /// The announced reconfiguration, until it switches.
+    scheduled: Arc<Mutex<Option<ScheduledSwitch>>>,
     /// The configuration file, when the configuration came from one.
     file: Arc<Mutex<Option<ConfigFile>>>,
 }
@@ -76,6 +115,9 @@ pub struct Applied {
     pub revision: u64,
     /// Valid but noteworthy consequences, such as reallocated SubChIds.
     pub warnings: Vec<String>,
+    /// Set for a multiplex reconfiguration: the running multiplex changes
+    /// then, and other changes are refused until it has.
+    pub scheduled: Option<ScheduledSwitch>,
 }
 
 /// Why an edit of the operator configuration was not applied.
@@ -91,7 +133,10 @@ pub enum EditError {
 
 impl From<anyhow::Error> for EditError {
     fn from(err: anyhow::Error) -> Self {
-        Self::Rejected(err)
+        match err.downcast::<SwitchPending>() {
+            Ok(pending) => Self::Conflict(pending.to_string()),
+            Err(err) => Self::Rejected(err),
+        }
     }
 }
 
@@ -117,6 +162,7 @@ impl SharedConfig {
             })),
             updates: Arc::new(Mutex::new(None)),
             update_lock: Arc::new(Mutex::new(())),
+            scheduled: Arc::new(Mutex::new(None)),
             file: Arc::new(Mutex::new(None)),
         }
     }
@@ -213,8 +259,25 @@ impl SharedConfig {
         *self.updates.lock().await = Some(sender);
     }
 
+    /// Make `config` the active configuration, ending any announcement.
     pub async fn commit(&self, config: ValidatedConfig) {
         *self.active.write().await = config;
+        *self.scheduled.lock().await = None;
+    }
+
+    /// Note an announced reconfiguration; changes are refused until
+    /// `commit` or `unschedule`.
+    pub async fn schedule(&self, switch: ScheduledSwitch) {
+        *self.scheduled.lock().await = Some(switch);
+    }
+
+    pub async fn unschedule(&self) {
+        *self.scheduled.lock().await = None;
+    }
+
+    /// The announced reconfiguration, if one is pending.
+    pub async fn scheduled(&self) -> Option<ScheduledSwitch> {
+        self.scheduled.lock().await.clone()
     }
 
     /// Validate `candidate` and hand it to the runtime unless it runs
@@ -269,12 +332,22 @@ impl SharedConfig {
     }
 
     async fn apply_locked(&self, candidate: Config) -> anyhow::Result<Applied> {
+        // Until the switch, the active configuration is the one being
+        // replaced; a change compared with it could undo the scheduled one.
+        if let Some(switch) = self.scheduled().await {
+            return Err(SwitchPending(switch).into());
+        }
         let validated = candidate.clone().validate()?;
         let warnings = self.warnings(&validated).await;
         let changed = *self.active.read().await != validated;
-        if changed {
-            self.send_to_runtime(validated).await?;
-        }
+        let scheduled = if changed {
+            match self.send_to_runtime(validated).await? {
+                Activation::Applied => None,
+                Activation::Scheduled(switch) => Some(switch),
+            }
+        } else {
+            None
+        };
         let mut source = self.source.write().await;
         if source.config != candidate {
             source.number += 1;
@@ -284,10 +357,11 @@ impl SharedConfig {
             changed,
             revision: source.number,
             warnings,
+            scheduled,
         })
     }
 
-    async fn send_to_runtime(&self, config: ValidatedConfig) -> anyhow::Result<bool> {
+    async fn send_to_runtime(&self, config: ValidatedConfig) -> anyhow::Result<Activation> {
         let sender = self
             .updates
             .lock()
@@ -2106,7 +2180,7 @@ output:
         tokio::spawn(async move {
             while let Some(update) = rx.recv().await {
                 worker.commit(update.candidate).await;
-                let _ = update.reply.send(Ok(true));
+                let _ = update.reply.send(Ok(Activation::Applied));
             }
         });
         let mut changed = example();
@@ -2143,9 +2217,58 @@ output:
         tokio::spawn(async move {
             while let Some(update) = rx.recv().await {
                 worker.commit(update.candidate).await;
-                let _ = update.reply.send(Ok(true));
+                let _ = update.reply.send(Ok(Activation::Applied));
             }
         });
+    }
+
+    #[tokio::test]
+    async fn changes_are_refused_while_a_reconfiguration_is_scheduled() {
+        let shared = SharedConfig::new(example(), example().validate().unwrap());
+        let switch = ScheduledSwitch {
+            at: chrono::DateTime::from_timestamp_millis(1_791_500_000_000).unwrap(),
+            cif_count: 300,
+        };
+        // A runtime that schedules every update and switches on request.
+        let (tx, mut rx) = mpsc::channel(1);
+        shared.install_updates(tx).await;
+        let (switch_tx, mut switch_rx) = mpsc::channel::<()>(1);
+        let worker = shared.clone();
+        let scheduled = switch.clone();
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                worker.schedule(scheduled.clone()).await;
+                let _ = update
+                    .reply
+                    .send(Ok(Activation::Scheduled(scheduled.clone())));
+                switch_rx.recv().await;
+                worker.commit(update.candidate).await;
+            }
+        });
+
+        let mut bitrate = example();
+        bitrate.services[0].components[0].bitrate = Some(64);
+        let applied = shared.apply(bitrate).await.unwrap();
+        assert_eq!(applied.scheduled.as_ref(), Some(&switch));
+        assert_eq!(shared.scheduled().await, Some(switch));
+
+        // Even an edit back to the configuration still active is refused.
+        let err = shared.apply(example()).await.unwrap_err();
+        assert!(err.is::<SwitchPending>(), "{err:#}");
+        let edit = shared.edit(None, |config| {
+            config.services[0].label = "Other".into();
+            Ok(())
+        });
+        assert!(matches!(edit.await, Err(EditError::Conflict(_))));
+
+        switch_tx.send(()).await.unwrap();
+        while shared.scheduled().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.read().await.subchannels[0].bitrate, 64);
+        let mut label = shared.source().await.config;
+        label.services[0].label = "Other".into();
+        assert!(shared.apply(label).await.unwrap().changed);
     }
 
     #[tokio::test]

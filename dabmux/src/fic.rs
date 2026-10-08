@@ -14,6 +14,11 @@
 //! 5. All remaining space carries FIG 0/5, 0/8, 0/9, 0/13, 0/17 and 0/20, and
 //!    change indications for five seconds after a reload, in rotation; each
 //!    must repeat at least once per second.
+//!
+//! While a multiplex reconfiguration is announced (clause 6.5), FIG 0/0
+//! carries the change flags and occurrence change, the MCI pass also carries
+//! the next configuration's FIG 0/1, 0/2, 0/3, 0/7 and 0/14 with C/N = 1, and
+//! the rotation its FIG 0/8 and 0/13.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,19 +43,28 @@ const SPI_PROFILE_BASIC: u8 = 0x01;
 const FEC_SCHEME_RS: u8 = 1;
 /// Frames per MCI repetition period (96 ms).
 const MCI_PERIOD_FRAMES: u64 = 4;
+/// Frames per MCI repetition period while a reconfiguration is announced:
+/// the next MCI within two 96 ms periods, and the current one only once in
+/// that time (clause 6.1).
+const ANNOUNCED_MCI_PERIOD_FRAMES: u64 = 8;
 const FIB_DATA_BYTES: usize = 30;
 /// Bytes per frame credited to the database rotation, about 170 bytes/s.
 /// Credit accumulates up to a whole FIB so that large fields fit.
 const DATABASE_BYTES_PER_FRAME: usize = 4;
 /// Frames for one cycle of all labels, just under the required second.
 const LABEL_CYCLE_FRAMES: u64 = 40;
+/// The occurrence change holds the lower part of the CIF count, so it
+/// addresses at most 249 CIFs ahead (clauses 6.4.1 and 6.5).
+pub const MAX_ANNOUNCEMENT_FRAMES: u64 = 249;
+/// C/N flag of the FIG type 0 header: the next configuration.
+const NEXT: u8 = 0x80;
 
 mod database;
 pub use database::DatabaseEvents;
 
 pub struct FicCarousel {
     mci: Cursor,
-    /// The 96 ms period whose MCI pass has been sent.
+    /// First frame of the MCI repetition period whose pass has been sent.
     mci_sent_for: Option<u64>,
     time_due: bool,
     label_cursor: usize,
@@ -63,6 +77,16 @@ pub struct FicCarousel {
     /// Frame count until which `events` are signalled.
     events_until: u64,
     reconfiguration_counter: Option<u16>,
+    announced: Option<Announced>,
+}
+
+/// The next configuration, encoded once when announced.
+struct Announced {
+    /// Frame count of the first CIF of the next configuration.
+    at: u64,
+    mci: Vec<Group>,
+    /// FIG 0/8 and 0/13, which may follow at the slower rate (clause 6.1).
+    applications: Vec<Group>,
 }
 
 impl Default for FicCarousel {
@@ -85,7 +109,44 @@ impl FicCarousel {
             events: DatabaseEvents::default(),
             events_until: 0,
             reconfiguration_counter: None,
+            announced: None,
         }
+    }
+
+    /// Announce that `next` replaces the configuration from frame `at`,
+    /// signalling `counter` in its FIG 0/7. The announcement starts once `at`
+    /// is within reach of the occurrence change. The runtime replaces the
+    /// carousel when it switches.
+    pub fn announce(&mut self, next: &ValidatedConfig, at: u64, counter: Option<u16>) {
+        let mut mci = mci_groups(next);
+        if let Some(counter) = counter {
+            let entry = fig0_7_entry(counter, next.source.services.len() as u8);
+            mci.push(Group::new(7, false, vec![entry.to_vec()]));
+        }
+        let applications = application_groups(next);
+        let flag = |mut groups: Vec<Group>| {
+            for group in &mut groups {
+                group.extension |= NEXT;
+            }
+            groups
+        };
+        self.announced = Some(Announced {
+            at,
+            mci: flag(mci),
+            applications: flag(applications),
+        });
+    }
+
+    /// Stop announcing a reconfiguration that will not take place.
+    pub fn withdraw(&mut self) {
+        self.announced = None;
+    }
+
+    /// The announcement whose occurrence change is within reach at `count`.
+    fn announcing(&self, count: u64) -> Option<&Announced> {
+        self.announced
+            .as_ref()
+            .filter(|next| next.at > count && next.at - count <= MAX_ANNOUNCEMENT_FRAMES)
     }
 
     /// Signal `events` for five seconds from frame `count`, withholding the
@@ -112,7 +173,8 @@ impl FicCarousel {
             .count
             .is_multiple_of(cifs_per_transmission_frame(mode))
         {
-            fibs[0].push(&fig0_0(config.source.ensemble.id, clock.count))?;
+            let next_at = self.announcing(clock.count).map(|next| next.at);
+            fibs[0].push(&fig0_0(config.source.ensemble.id, clock.count, next_at))?;
             let counter = self
                 .reconfiguration_counter
                 .or(config.source.ensemble.reconfiguration_counter);
@@ -144,9 +206,20 @@ impl FicCarousel {
             }
         }
 
-        let period = clock.count / MCI_PERIOD_FRAMES;
+        let next = self.announcing(clock.count);
+        let period_frames = if next.is_some() {
+            ANNOUNCED_MCI_PERIOD_FRAMES
+        } else {
+            MCI_PERIOD_FRAMES
+        };
+        let period = clock.count / period_frames * period_frames;
         if self.mci_sent_for != Some(period) {
-            let groups = mci_groups(config);
+            // Next after current, so that a pass under way when the
+            // announcement starts keeps its place.
+            let mut groups = mci_groups(config);
+            if let Some(next) = next {
+                groups.extend(next.mci.iter().cloned());
+            }
             for fib in &mut fibs {
                 if fill(fib, &groups, &mut self.mci, Fill::OnePass)? {
                     self.mci_sent_for = Some(period);
@@ -179,6 +252,9 @@ impl FicCarousel {
         groups.extend(database::sci_groups(&config.databases));
         if events_active {
             groups.extend(self.events.groups().iter().cloned());
+        }
+        if let Some(next) = self.announcing(clock.count) {
+            groups.extend(next.applications.iter().cloned());
         }
         for fib in &mut fibs {
             fill(fib, &groups, &mut self.information, Fill::Repeat)?;
@@ -452,16 +528,18 @@ fn mci_groups(config: &ValidatedConfig) -> Vec<Group> {
     ]
 }
 
+/// Whether replacing `active` with `candidate` is a multiplex
+/// reconfiguration: a change to the ensemble identity or to any MCI FIG
+/// (clause 6.1). Such a change has to be announced (clause 6.5).
+pub fn reconfigures(active: &ValidatedConfig, candidate: &ValidatedConfig) -> bool {
+    active.source.ensemble.id != candidate.source.ensemble.id
+        || mci_groups(active) != mci_groups(candidate)
+        || application_groups(active) != application_groups(candidate)
+}
+
 /// FIG 0/5, 0/17, 0/9, 0/13 and 0/8, the latter two split by P/D.
 fn information_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group> {
     let source = &config.source;
-    let sid = |index: usize| -> Vec<u8> {
-        if config.services[index].data {
-            source.services[index].id.to_be_bytes().to_vec()
-        } else {
-            (source.services[index].id as u16).to_be_bytes().to_vec()
-        }
-    };
     // One FIG 0/5 entry per audio subchannel; validation rejects conflicts.
     let mut signalled = HashSet::new();
     let languages = config
@@ -484,6 +562,26 @@ fn information_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group>
             vec![high, low, 0, service.pty]
         })
         .collect();
+    let mut groups = vec![
+        Group::new(5, false, languages),
+        Group::new(17, false, programme_types),
+        Group::new(9, false, vec![fig0_9_entry(config, clock)]),
+    ];
+    groups.extend(application_groups(config));
+    groups
+}
+
+/// FIG 0/13 and 0/8, each split by P/D: the part of the MCI that may be
+/// signalled at the slower rate (clause 6.1).
+fn application_groups(config: &ValidatedConfig) -> Vec<Group> {
+    let source = &config.source;
+    let sid = |index: usize| -> Vec<u8> {
+        if config.services[index].data {
+            source.services[index].id.to_be_bytes().to_vec()
+        } else {
+            (source.services[index].id as u16).to_be_bytes().to_vec()
+        }
+    };
     let mut applications = [Vec::new(), Vec::new()];
     let mut definitions = [Vec::new(), Vec::new()];
     for (component, raw) in config.components.iter().zip(&source.components) {
@@ -523,9 +621,6 @@ fn information_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group>
     let [programme_applications, data_applications] = applications;
     let [programme_definitions, data_definitions] = definitions;
     vec![
-        Group::new(5, false, languages),
-        Group::new(17, false, programme_types),
-        Group::new(9, false, vec![fig0_9_entry(config, clock)]),
         Group::new(13, false, programme_applications),
         Group::new(13, true, data_applications),
         Group::new(8, false, programme_definitions),
@@ -533,11 +628,16 @@ fn information_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group>
     ]
 }
 
-fn fig0_0(eid: u16, count: u64) -> [u8; 6] {
+/// FIG 0/0; `next_at` announces the frame count from which the next
+/// configuration applies, with Change flags 11 and the occurrence change.
+fn fig0_0(eid: u16, count: u64, next_at: Option<u64>) -> Vec<u8> {
     let high = ((count / 250) % 20) as u8;
     let low = (count % 250) as u8;
     let [e0, e1] = eid.to_be_bytes();
-    [5, 0, e0, e1, high, low]
+    match next_at {
+        None => vec![5, 0, e0, e1, high, low],
+        Some(at) => vec![6, 0, e0, e1, 0xc0 | high, low, (at % 250) as u8],
+    }
 }
 
 /// Country, LTO and international table, with the extended field listing
@@ -596,9 +696,12 @@ fn fig0_9_entry(config: &ValidatedConfig, clock: FrameClock) -> Vec<u8> {
 }
 
 fn fig0_7(counter: u16, service_count: u8) -> [u8; 4] {
+    let [high, low] = fig0_7_entry(counter, service_count);
+    [3, 7, high, low]
+}
+
+fn fig0_7_entry(counter: u16, service_count: u8) -> [u8; 2] {
     [
-        3,
-        7,
         (service_count << 2) | ((counter >> 8) as u8 & 3),
         counter as u8,
     ]
@@ -795,8 +898,14 @@ mod tests {
             }
             other => panic!("unexpected FIG {other:?}"),
         }
+        // C/N = 1 on MCI marks the next configuration (clause 6.1).
+        if fig.kind == 0 && fig.bytes[1] & NEXT != 0 && MCI_EXTENSIONS.contains(&fig.extension) {
+            keys = keys.into_iter().map(|key| format!("next {key}")).collect();
+        }
         keys
     }
+
+    const MCI_EXTENSIONS: [u8; 7] = [1, 2, 3, 7, 8, 13, 14];
 
     /// Fields of FIG 0/6, 0/20, 0/21 and 0/24, per EN 300 401 figures 53,
     /// 40, 46 and 47.
@@ -892,10 +1001,37 @@ mod tests {
     /// mux-zh: 17 DAB+ services with slideshow, BOLLERWAGEN's foreign ECC
     /// and the SPI data service.
     fn mux_zh() -> ValidatedConfig {
-        parse_yaml(include_str!("../config.mux-zh.example.yaml"))
-            .unwrap()
-            .validate()
-            .unwrap()
+        mux_zh_source().validate().unwrap()
+    }
+
+    fn mux_zh_source() -> Config {
+        parse_yaml(include_str!("../config.mux-zh.example.yaml")).unwrap()
+    }
+
+    /// mux-zh before and after its first service drops from 72 to 64 kbit/s.
+    fn mux_zh_bitrate_change() -> (ValidatedConfig, ValidatedConfig) {
+        let mut next = mux_zh_source();
+        next.services[0].components[0].bitrate = Some(64);
+        (mux_zh(), next.validate().unwrap())
+    }
+
+    /// FIGs of the frames from `count` 0 while `next`, from frame `at`, is
+    /// announced.
+    fn run_announced(
+        config: &ValidatedConfig,
+        next: &ValidatedConfig,
+        at: u64,
+        frames: u64,
+    ) -> Vec<Vec<Fig>> {
+        let mut carousel = FicCarousel::new().with_reconfiguration_counter(Some(7));
+        carousel.announce(next, at, Some(8));
+        (0..frames)
+            .map(|count| {
+                let clock =
+                    FrameClock::new(count, 1_704_164_645, (count % 41) as u16 * 24).unwrap();
+                figs(&carousel.write(config, clock).unwrap()).concat()
+            })
+            .collect()
     }
 
     fn expected_mci(config: &ValidatedConfig) -> HashSet<String> {
@@ -1047,6 +1183,98 @@ output: {destinations: [{protocol: tcp, listen_port: 8850}]}
                 .write(&valid, FrameClock::new(count, 0, 0).unwrap())
                 .unwrap();
             assert_eq!(fic[..2] == [5, 0], expected, "mode {mode} frame {count}");
+        }
+    }
+
+    #[test]
+    fn announcement_sets_change_flags_and_occurrence_change() {
+        let (active, next) = mux_zh_bitrate_change();
+        // The occurrence change reaches 249 CIFs: frames before 151 do not
+        // announce a switch at 400 yet.
+        let frames = run_announced(&active, &next, 400, 420);
+        for (count, figs) in frames.iter().enumerate() {
+            let count = count as u64;
+            let fig0_0 = figs.iter().find(|fig| fig.kind == 0 && fig.extension == 0);
+            assert_eq!(fig0_0.is_some(), count.is_multiple_of(4), "frame {count}");
+            let Some(fig0_0) = fig0_0 else { continue };
+            let body = fig0_0.body();
+            assert_eq!(
+                (u16::from(body[2] & 0x1f) * 250 + u16::from(body[3])) as u64,
+                count % 5000
+            );
+            if (151..400).contains(&count) {
+                assert_eq!(body[2] >> 6, 0b11, "change flags in frame {count}");
+                assert_eq!(body[4..], [(400 % 250) as u8], "occurrence change");
+            } else {
+                assert_eq!(body[2] >> 6, 0, "change flags in frame {count}");
+                assert_eq!(body.len(), 4, "no occurrence change in frame {count}");
+            }
+        }
+        for (count, figs) in frames.iter().enumerate() {
+            let next_mci = figs
+                .iter()
+                .flat_map(entries)
+                .any(|key| key.starts_with("next "));
+            assert!(
+                !next_mci || (151..400).contains(&count),
+                "next MCI in frame {count}"
+            );
+        }
+        assert!(frames[151..159]
+            .iter()
+            .flatten()
+            .flat_map(entries)
+            .any(|key| key.starts_with("next ")));
+    }
+
+    #[test]
+    fn announced_and_current_mci_complete_within_two_96_ms_periods() {
+        let (active, next) = mux_zh_bitrate_change();
+        let frames = run_announced(&active, &next, 240, 240);
+        let current = expected_mci(&active);
+        let mut announced: HashSet<String> = expected_mci(&next)
+            .into_iter()
+            .map(|key| format!("next {key}"))
+            .collect();
+        announced.insert("next 0/7".into());
+        // Clause 6.1: during the reconfiguration, the next MCI within two
+        // consecutive 96 ms periods; the current once in that time.
+        for (period, window) in frames.chunks(8).enumerate() {
+            let sent: HashSet<String> = window.iter().flatten().flat_map(entries).collect();
+            for expected in [&current, &announced] {
+                let missing: Vec<_> = expected.difference(&sent).collect();
+                assert!(
+                    missing.is_empty(),
+                    "192 ms period {period} misses {missing:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn information_and_next_applications_repeat_once_per_second_while_announced() {
+        let (active, next) = mux_zh_bitrate_change();
+        let frames = run_announced(&active, &next, 240, 240);
+        let mut seen: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, figs) in frames.iter().enumerate() {
+            for key in figs.iter().flat_map(entries) {
+                seen.entry(key).or_default().push(index);
+            }
+        }
+        let count = |prefix: &str| seen.keys().filter(|key| key.starts_with(prefix)).count();
+        assert_eq!(
+            [
+                count("0/13 "),
+                count("0/8 "),
+                count("next 0/13 "),
+                count("next 0/8 ")
+            ],
+            [18, 18, 18, 18]
+        );
+        for (key, frames) in &seen {
+            let gaps = std::iter::once(frames[0] + 1).chain(frames.windows(2).map(|w| w[1] - w[0]));
+            let worst = gaps.max().unwrap();
+            assert!(worst <= 41, "{key} repeats only every {worst} frames");
         }
     }
 
@@ -1380,7 +1608,7 @@ output: {destinations: [{protocol: tcp, listen_port: 8850}]}
 mod oracle_tests {
     use super::*;
     use crate::config::testing::{dab_plus, example, service};
-    use crate::config::{ProtectionConfig, UserApplication};
+    use crate::config::{Config, ProtectionConfig, UserApplication};
     use crate::testsupport::edinburgh::fic::{DateTimeUTC, FicDecoder, Fig};
     use crate::testsupport::edinburgh::tables;
     use std::collections::{HashMap, HashSet};
@@ -1393,6 +1621,10 @@ mod oracle_tests {
     }
 
     fn twelve_service_config() -> ValidatedConfig {
+        twelve_service_source().validate().unwrap()
+    }
+
+    fn twelve_service_source() -> Config {
         let mut config = example();
         config.ensemble.label = "Grüezi Mux".into();
         config.ensemble.short_label = Some("Grüezi".into());
@@ -1420,7 +1652,39 @@ mod oracle_tests {
             station.language = 8;
             config.services.push(station);
         }
-        config.validate().unwrap()
+        config
+    }
+
+    #[test]
+    fn decoder_reads_the_announced_reconfiguration() {
+        let mut next = twelve_service_source();
+        next.services[0].components[0].bitrate = Some(64);
+        let (active, next) = (twelve_service_config(), next.validate().unwrap());
+        let first = next.subchannels[0].id;
+        let mut carousel = FicCarousel::new();
+        carousel.announce(&next, 1240, None);
+        let mut sizes = HashMap::new();
+        for count in 1000..1100 {
+            for fig in decode(
+                &carousel
+                    .write(&active, FrameClock::new(count, 0, 0).unwrap())
+                    .unwrap(),
+            ) {
+                match fig {
+                    Fig::F0_0(f) => {
+                        assert_eq!(f.cif_count, count as u16);
+                        assert_eq!((f.change_flags, f.occurrence_change), (3, Some(240)));
+                    }
+                    Fig::F0_1(f) => {
+                        for sub in f.subchannels.iter().filter(|sub| sub.id == first) {
+                            sizes.insert(f.base.cn, sub.bitrate);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(sizes, HashMap::from([(false, Some(72)), (true, Some(64))]));
     }
 
     #[test]

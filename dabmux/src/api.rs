@@ -23,14 +23,24 @@ async fn push_config(
     match result {
         Ok(applied) => (
             StatusCode::OK,
-            Json(serde_json::json!({"changed": applied.changed})),
+            Json(serde_json::json!({
+                "changed": applied.changed,
+                "scheduled": applied.scheduled,
+            })),
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("{err:#}")})),
-        )
-            .into_response(),
+        Err(err) => {
+            let status = if err.is::<crate::config::SwitchPending>() {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": format!("{err:#}")})),
+            )
+                .into_response()
+        }
     }
 }
 

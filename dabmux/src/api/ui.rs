@@ -47,13 +47,15 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// The running configuration and whether the configuration file holds it.
+/// The running configuration, whether the configuration file holds it, and
+/// the switch it takes effect at if it is an announced reconfiguration.
 async fn get_config(State(state): State<AppState>) -> Response {
     let source = state.config.source().await;
     let file = state.config.file_status().await;
+    let scheduled = state.config.scheduled().await;
     with_revision(
         source.number,
-        json!({ "config": source.config, "file": file }),
+        json!({ "config": source.config, "file": file, "scheduled": scheduled }),
     )
 }
 
@@ -396,6 +398,7 @@ fn applied_response(status: StatusCode, mut body: Value, applied: Applied) -> Re
     body["changed"] = applied.changed.into();
     body["revision"] = applied.revision.into();
     body["warnings"] = applied.warnings.into();
+    body["scheduled"] = json!(applied.scheduled);
     let mut response = (status, Json(body)).into_response();
     set_etag(&mut response, applied.revision);
     response

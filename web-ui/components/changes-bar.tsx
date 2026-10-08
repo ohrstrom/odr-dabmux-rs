@@ -26,11 +26,18 @@ import { formatValue, type ChangeGroup } from "@/lib/diff"
 import { ApiError, type Applied, type ServiceConfig } from "@/lib/ui-api"
 
 function announceApplied(applied: Applied) {
-  toast.success("Changes applied", {
-    description: applied.changed
-      ? `Revision ${applied.revision} is on air.`
-      : "The running multiplex did not change.",
-  })
+  if (applied.scheduled) {
+    const at = new Date(applied.scheduled.at).toLocaleTimeString()
+    toast.success("Reconfiguration announced", {
+      description: `Revision ${applied.revision} goes on air at ${at} (CIF ${applied.scheduled.cif_count}). Further changes are refused until then.`,
+    })
+  } else {
+    toast.success("Changes applied", {
+      description: applied.changed
+        ? `Revision ${applied.revision} is on air.`
+        : "The running multiplex did not change.",
+    })
+  }
   for (const warning of applied.warnings) toast.warning(warning)
 }
 

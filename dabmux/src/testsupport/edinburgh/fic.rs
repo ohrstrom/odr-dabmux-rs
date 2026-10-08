@@ -16,7 +16,7 @@ pub struct Subchannel {
 
 #[derive(Debug, Serialize)]
 pub struct Fig0 {
-    cn: bool,
+    pub cn: bool,
     oe: bool,
     pd: bool,
     ext: u8,
@@ -35,10 +35,13 @@ pub struct Fig0_0 {
     base: Fig0,
     pub eid: u16,
     pub al_flag: bool,
+    /// Local addition: change flags, CIF count and occurrence change.
+    pub change_flags: u8,
+    pub cif_count: u16,
+    pub occurrence_change: Option<u8>,
 }
 impl Fig0_0 {
     // FIG 0/0 - Ensemble information (MCI)
-    // EID and alarm flag only
     pub fn from_bytes(base: Fig0, data: &[u8]) -> Result<Self, FigError> {
         if data.len() < 4 {
             return Err(FigError::InvalidSize { l: data.len() });
@@ -47,18 +50,36 @@ impl Fig0_0 {
         // 16-bit Ensemble ID (Big-Endian)
         let eid = u16::from_be_bytes([data[0], data[1]]);
 
+        // change flags (bits 7-6 of data[2])
+        let change_flags = data[2] >> 6;
+
         // alarm flag (bit 5 of data[2])
         let al_flag = (data[2] & 0x20) != 0;
 
-        // log::debug!("FIG0/0: EID: 0x{:04X}, AL: {}", eid, al_flag);
+        // CIF count: modulo-20 high part, modulo-250 low part
+        let cif_count = u16::from(data[2] & 0x1f) * 250 + u16::from(data[3]);
 
-        Ok(Self { base, eid, al_flag })
+        // occurrence change, present unless the change flags are 00
+        let occurrence_change = match (change_flags, data.get(4)) {
+            (0, _) => None,
+            (_, Some(occurrence)) => Some(*occurrence),
+            (_, None) => return Err(FigError::InvalidSize { l: data.len() }),
+        };
+
+        Ok(Self {
+            base,
+            eid,
+            al_flag,
+            change_flags,
+            cif_count,
+            occurrence_change,
+        })
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct Fig0_1 {
-    base: Fig0,
+    pub base: Fig0,
     pub subchannels: Vec<Subchannel>,
 }
 

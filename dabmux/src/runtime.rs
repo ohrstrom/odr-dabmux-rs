@@ -11,10 +11,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration, MissedTickBehavior};
 
 use crate::config::{
-    ConfigUpdate, EdiDestination, InputConfig, InputEndpoint, InputTiming, SharedConfig,
-    Subchannel, SubchannelKind, Transport, ValidatedConfig,
+    Activation, ConfigUpdate, EdiDestination, InputConfig, InputEndpoint, InputTiming,
+    ScheduledSwitch, SharedConfig, Subchannel, SwitchPending, Transport, ValidatedConfig,
 };
-use crate::fic::FicCarousel;
+use crate::fic::{self, FicCarousel};
 use crate::timing::{TaiClock, TaiSource};
 use dabmux::edi::{
     decode_sti_payload, decode_sti_rtp, fragment_af, pointer_tag, AfPacket, AudioLevels, Deti, Est,
@@ -38,6 +38,16 @@ const DROP_WARN_FRAMES: u64 = 10;
 /// plays them. Beyond this lag they are too late for any TIST offset and a
 /// burst would overflow the TCP output queues, so the mux skips ahead instead.
 const MAX_CATCH_UP: Duration = Duration::from_secs(10);
+/// A multiplex reconfiguration switches on a multiple of this many CIFs,
+/// which opens a transmission frame in every mode.
+const RECONFIGURATION_GRID: u64 = 20;
+/// Least announcement of a reconfiguration. Rounded up to the grid, the
+/// switch falls 230 to 249 CIFs (5.5 to 6 s) ahead: about the six seconds
+/// EN 300 401 clause 6.5 recommends, and within reach of the occurrence change.
+const RECONFIGURATION_LEAD: u64 = fic::MAX_ANNOUNCEMENT_FRAMES + 1 - RECONFIGURATION_GRID;
+/// A multiplex configuration shall remain stable for at least six seconds
+/// (250 CIFs, clause 6.5).
+const STABLE_CONFIGURATION_FRAMES: u64 = 250;
 
 /// How to handle a frame whose tick was due `lag` ago.
 #[derive(Debug, PartialEq, Eq)]
@@ -1185,41 +1195,54 @@ fn commit_resources(
     *udp_destinations = next_udp;
 }
 
-/// Multiplex configuration information receivers must reacquire on change:
-/// ensemble ID (FIG 0/0), sub-channel organisation (FIG 0/1) and service
-/// organisation (FIG 0/2).
-type Mci = (
-    u16,
-    Vec<(u8, u16, u16, u8)>,
-    Vec<(u32, Vec<(u8, u8, SubchannelKind)>)>,
-);
+type Reply = tokio::sync::oneshot::Sender<Result<Activation>>;
 
-fn mci(config: &ValidatedConfig) -> Mci {
-    let subchannels = config
-        .subchannels
-        .iter()
-        .map(|sub| (sub.id, sub.start_address_cu, sub.size_cu, sub.tpl))
-        .collect();
-    let services = config
-        .source
-        .services
-        .iter()
-        .enumerate()
-        .map(|(index, service)| {
-            let components = config
-                .service_components(index)
-                .map(|component| {
-                    (
-                        config.subchannels[component.subchannel].id,
-                        component.scids,
-                        config.source.subchannels[component.subchannel].kind,
-                    )
-                })
-                .collect();
-            (service.id, components)
-        })
-        .collect();
-    (config.source.ensemble.id, subchannels, services)
+/// A multiplex reconfiguration announced in the FIC.
+struct Announced {
+    candidate: ValidatedConfig,
+    resources: PreparedResources,
+    /// Frame count of the first frame of `candidate`.
+    at: u64,
+    switch: ScheduledSwitch,
+}
+
+/// The system time and CIF count of frame `at`, seen from `clock`.
+fn scheduled_switch(clock: FrameClock, active: &ValidatedConfig, at: u64) -> ScheduledSwitch {
+    // The frame clock runs ahead of system time by the TIST offset.
+    let millis = clock.unix_seconds * 1000 + i64::from(clock.millisecond)
+        - i64::from(active.source.ensemble.tist_offset_ms)
+        + ((at - clock.count) * FRAME_PERIOD_MS) as i64;
+    ScheduledSwitch {
+        at: chrono::DateTime::from_timestamp_millis(millis).unwrap_or_default(),
+        cif_count: (at % 5000) as u16,
+    }
+}
+
+/// The frame from which an announced reconfiguration applies: on the grid,
+/// at least the lead ahead of `count`, and no sooner than the active
+/// configuration, in force since `since`, may change.
+fn reconfiguration_frame(count: u64, since: u64) -> u64 {
+    (count + RECONFIGURATION_LEAD)
+        .max(since + STABLE_CONFIGURATION_FRAMES)
+        .next_multiple_of(RECONFIGURATION_GRID)
+}
+
+/// The frame clock once `candidate` replaces `active`, which may shift TIST
+/// or rephase the frame count.
+fn clock_for(
+    clock: FrameClock,
+    active: &ValidatedConfig,
+    candidate: &ValidatedConfig,
+) -> Result<FrameClock> {
+    let mut next = clock;
+    next.shift_millis(
+        i64::from(candidate.source.ensemble.tist_offset_ms)
+            - i64::from(active.source.ensemble.tist_offset_ms),
+    )?;
+    if candidate.source.ensemble.tist_at_fct0_ms != active.source.ensemble.tist_at_fct0_ms {
+        next.rephase_fct0(candidate.source.ensemble.tist_at_fct0_ms)?;
+    }
+    Ok(next)
 }
 
 /// FIG 0/7 count after an activation. A count set in the new configuration
@@ -1364,6 +1387,10 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
     }
     let mut active = initial;
     let mut pending: Option<(ConfigUpdate, PreparedResources)> = None;
+    // A reconfiguration announced in the FIC, and the frame it applies from.
+    let mut announced: Option<Announced> = None;
+    // Frame from which the active multiplex configuration applies.
+    let mut configuration_since = clock.count;
     let mut frame_failing = false;
     let mut drift_warned = false;
 
@@ -1410,87 +1437,132 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             }
         }
 
-        // Switch configurations only where a transmission frame begins.
+        // Switch configurations only where a transmission frame begins. A
+        // multiplex reconfiguration is announced first and switches on the
+        // announced frame; other changes switch right away.
         let frame_boundary = clock
             .count
             .is_multiple_of(cifs_per_transmission_frame(active.source.ensemble.mode));
+        // The reply goes out when the change is active, or for a
+        // reconfiguration once it is scheduled.
+        let mut due: Option<(ValidatedConfig, PreparedResources, Option<Reply>)> = announced
+            .take_if(|next| frame_boundary && clock.count >= next.at)
+            .map(|next| (next.candidate, next.resources, None));
+        if let Some(next) = &announced {
+            // SharedConfig refuses changes until the switch; this is a backstop.
+            if let Some((update, _)) = pending.take() {
+                let _ = update
+                    .reply
+                    .send(Err(SwitchPending(next.switch.clone()).into()));
+            }
+        }
         if let Some((update, resources)) = pending.take_if(|_| frame_boundary) {
-            let candidate = update.candidate;
-            let mut next_clock = clock;
-            let clock_change = next_clock
-                .shift_millis(
-                    i64::from(candidate.source.ensemble.tist_offset_ms)
-                        - i64::from(active.source.ensemble.tist_offset_ms),
-                )
-                .and_then(|()| {
-                    if candidate.source.ensemble.tist_at_fct0_ms
-                        != active.source.ensemble.tist_at_fct0_ms
-                    {
-                        next_clock.rephase_fct0(candidate.source.ensemble.tist_at_fct0_ms)
-                    } else {
-                        Ok(())
-                    }
-                });
-            if let Err(err) = clock_change {
-                let _ = update.reply.send(Err(err));
+            let ConfigUpdate { candidate, reply } = update;
+            if !fic::reconfigures(&active, &candidate) {
+                due = Some((candidate, resources, Some(reply)));
+            } else if let Err(err) = clock_for(clock, &active, &candidate) {
+                let _ = reply.send(Err(err));
             } else {
-                clock = next_clock;
-                let structure_changed = mci(&candidate) != mci(&active);
-                for warning in candidate.warnings() {
-                    tracing::warn!("{warning}");
-                }
-                let reallocated = candidate.reallocated_subchannels(&active);
-                if !reallocated.is_empty() {
-                    let changes = reallocated
-                        .iter()
-                        .map(|(name, from, to)| format!("{name} {from}->{to}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    tracing::warn!(
-                        %changes,
-                        "allocated SubChIds changed; receivers lose these services until they rescan; set subchannel_id to keep them stable"
-                    );
-                }
-                let tai_offset = resources.tai_offset;
-                commit_resources(
-                    &candidate,
-                    resources,
-                    &mut receivers,
-                    &mut tcp_outputs,
-                    &mut udp_destinations,
-                    &stats,
-                );
-                reconfiguration_counter = next_reconfiguration_counter(
+                let at = reconfiguration_frame(clock.count, configuration_since);
+                let counter = next_reconfiguration_counter(
                     active.source.ensemble.reconfiguration_counter,
                     candidate.source.ensemble.reconfiguration_counter,
                     reconfiguration_counter,
-                    structure_changed,
+                    true,
                 );
-                if structure_changed {
-                    for output in &tcp_outputs {
-                        output.clear_history();
+                let switch = scheduled_switch(clock, &active, at);
+                carousel.announce(&candidate, at, counter);
+                config.schedule(switch.clone()).await;
+                tracing::info!(
+                    at = %switch.at,
+                    cif_count = switch.cif_count,
+                    "multiplex reconfiguration announced"
+                );
+                let _ = reply.send(Ok(Activation::Scheduled(switch.clone())));
+                announced = Some(Announced {
+                    candidate,
+                    resources,
+                    at,
+                    switch,
+                });
+            }
+        }
+        if let Some((candidate, resources, reply)) = due {
+            match clock_for(clock, &active, &candidate) {
+                Err(err) => {
+                    carousel.withdraw();
+                    match reply {
+                        Some(reply) => {
+                            let _ = reply.send(Err(err));
+                        }
+                        None => {
+                            config.unschedule().await;
+                            tracing::error!(%err, "announced multiplex reconfiguration failed; the previous configuration stays active");
+                        }
                     }
-                    tracing::warn!(
-                        reconfiguration_counter,
-                        "ensemble structure changed; TCP preroll cleared; receivers may need to reacquire"
+                }
+                Ok(next_clock) => {
+                    let structure_changed = fic::reconfigures(&active, &candidate);
+                    clock = next_clock;
+                    for warning in candidate.warnings() {
+                        tracing::warn!("{warning}");
+                    }
+                    let reallocated = candidate.reallocated_subchannels(&active);
+                    if !reallocated.is_empty() {
+                        let changes = reallocated
+                            .iter()
+                            .map(|(name, from, to)| format!("{name} {from}->{to}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        tracing::warn!(
+                            %changes,
+                            "allocated SubChIds changed; receivers lose these services until they rescan; set subchannel_id to keep them stable"
+                        );
+                    }
+                    let tai_offset = resources.tai_offset;
+                    commit_resources(
+                        &candidate,
+                        resources,
+                        &mut receivers,
+                        &mut tcp_outputs,
+                        &mut udp_destinations,
+                        &stats,
                     );
+                    reconfiguration_counter = next_reconfiguration_counter(
+                        active.source.ensemble.reconfiguration_counter,
+                        candidate.source.ensemble.reconfiguration_counter,
+                        reconfiguration_counter,
+                        structure_changed,
+                    );
+                    if structure_changed {
+                        configuration_since = clock.count;
+                        for output in &tcp_outputs {
+                            output.clear_history();
+                        }
+                        tracing::info!(
+                            reconfiguration_counter,
+                            "multiplex reconfiguration applied; TCP preroll cleared"
+                        );
+                    }
+                    let new_tai_source = TaiSource::from_config(&candidate.source.ensemble);
+                    if tai_clock.source != new_tai_source {
+                        tai_clock = TaiClock::new(new_tai_source, tai_offset);
+                    }
+                    let events = fic::DatabaseEvents::between(&active, &candidate);
+                    if !events.is_empty() {
+                        tracing::info!("service following databases changed; signalling change indications for 5 s");
+                    }
+                    active = candidate.clone();
+                    carousel = FicCarousel::new()
+                        .with_reconfiguration_counter(reconfiguration_counter)
+                        .with_database_events(events, clock.count);
+                    config.commit(candidate).await;
+                    stats.config_activations.fetch_add(1, Ordering::Relaxed);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(Activation::Applied));
+                    }
+                    tracing::info!("complete mux configuration activated");
                 }
-                let new_tai_source = TaiSource::from_config(&candidate.source.ensemble);
-                if tai_clock.source != new_tai_source {
-                    tai_clock = TaiClock::new(new_tai_source, tai_offset);
-                }
-                let events = crate::fic::DatabaseEvents::between(&active, &candidate);
-                if !events.is_empty() {
-                    tracing::info!("service following databases changed; signalling change indications for 5 s");
-                }
-                active = candidate.clone();
-                carousel = FicCarousel::new()
-                    .with_reconfiguration_counter(reconfiguration_counter)
-                    .with_database_events(events, clock.count);
-                config.commit(candidate).await;
-                stats.config_activations.fetch_add(1, Ordering::Relaxed);
-                let _ = update.reply.send(Ok(true));
-                tracing::info!("complete mux configuration activated");
             }
         }
 
@@ -1624,6 +1696,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SubchannelKind;
 
     fn payload(bytes: Vec<u8>, seconds: Option<u32>, tsta: Option<u32>) -> TimedPayload {
         TimedPayload {
@@ -1734,15 +1807,35 @@ mod tests {
             timing: None,
             backpressure: None,
         });
-        assert_eq!(mci(&label.validate().unwrap()), mci(&active));
+        assert!(!fic::reconfigures(&active, &label.validate().unwrap()));
 
         let mut bitrate = base.clone();
         bitrate.services[0].components[0].bitrate = Some(104);
-        assert_ne!(mci(&bitrate.validate().unwrap()), mci(&active));
+        assert!(fic::reconfigures(&active, &bitrate.validate().unwrap()));
 
-        let mut sid = base;
+        let mut sid = base.clone();
         sid.services[0].id += 1;
-        assert_ne!(mci(&sid.validate().unwrap()), mci(&active));
+        assert!(fic::reconfigures(&active, &sid.validate().unwrap()));
+
+        // FIG 0/13 is MCI too.
+        let mut application = base;
+        application.services[0].components[0].user_applications =
+            vec![crate::config::UserApplication::Slideshow];
+        assert!(fic::reconfigures(&active, &application.validate().unwrap()));
+    }
+
+    #[test]
+    fn reconfiguration_switches_on_the_grid_about_six_seconds_ahead() {
+        // Long stable: 230 to 249 CIFs ahead, so the occurrence change is
+        // unambiguous, and on a frame that opens a transmission frame.
+        for count in 1000..1100 {
+            let at = reconfiguration_frame(count, 0);
+            assert!((230..=249).contains(&(at - count)), "{count} -> {at}");
+            assert!(at.is_multiple_of(20));
+        }
+        // Six seconds after the last switch at the earliest.
+        assert_eq!(reconfiguration_frame(1000, 980), 1240);
+        assert_eq!(reconfiguration_frame(1000, 1000), 1260);
     }
 
     #[tokio::test]

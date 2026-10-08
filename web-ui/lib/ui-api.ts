@@ -51,7 +51,15 @@ export type ComponentConfig = {
   data_groups?: boolean
 }
 
-export type Applied = { changed: boolean; revision: number; warnings: string[] }
+/** An announced multiplex reconfiguration: the mux switches at `at` (system time). */
+export type ScheduledSwitch = { at: string; cif_count: number }
+
+export type Applied = {
+  changed: boolean
+  revision: number
+  warnings: string[]
+  scheduled: ScheduledSwitch | null
+}
 
 export type Preview = { resolved: ResolvedConfig; warnings: string[] }
 
@@ -108,6 +116,7 @@ export function getConfig() {
     config: OperatorConfig
     revision: number
     file: FileStatus | null
+    scheduled: ScheduledSwitch | null
   }>("GET", "/config")
 }
 
