@@ -812,9 +812,10 @@ impl Multiplex {
             &self.ensemble.label,
             self.ensemble.short_label.as_deref(),
         )?;
-        if self.services.is_empty() {
-            bail!("at least one service is required");
-        }
+        // NOTE: odr-dabmux requires at least a service. but actually a mux can start "blank"
+        // if self.services.is_empty() {
+        //     bail!("at least one service is required");
+        // }
         if self.subchannels.len() > 64 {
             bail!("at most 64 subchannels are supported");
         }
