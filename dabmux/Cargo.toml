@@ -20,6 +20,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 serde_path_to_error = "0.1.20"
 serde_norway = "0.9.42"
+rust-embed = { version = "8.13.0", features = ["mime-guess"] }
 
 [[bin]]
 name = "dabmux"

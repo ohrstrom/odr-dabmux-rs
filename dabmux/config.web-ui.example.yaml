@@ -1,4 +1,4 @@
-# Written by dabmux on 2026-10-02 19:43:47 UTC. Comments are not kept; the previous
+# Written by dabmux on 2026-10-08 09:46:20 UTC. Comments are not kept; the previous
 # file, with its comments, is config.web-ui.example.yaml.bak.
 
 ensemble:
@@ -18,14 +18,17 @@ ensemble:
   - https://raw.githubusercontent.com/eggert/tz/master/leap-seconds.list
 services:
 - id: 0x4d01
-  label: Program 1
-  short_label: P1
+  label: Program 001
+  short_label: P01
   pty: 0
   language: 5
   components:
   - subchannel_id: 1
     type: dab_plus
     bitrate: 88
+    protection:
+      profile: eep_a
+      level: 3
     input:
       protocol: edi
       uri: tcp://127.0.0.1:9001
@@ -39,7 +42,7 @@ services:
   components:
   - subchannel_id: 2
     type: dab_plus
-    bitrate: 72
+    bitrate: 88
     input:
       protocol: edi
       uri: tcp://127.0.0.1:9002

@@ -9,6 +9,7 @@ mod runtime;
 #[cfg(test)]
 mod testsupport;
 mod timing;
+mod web_ui;
 
 use crate::app::App;
 use crate::args::Args;

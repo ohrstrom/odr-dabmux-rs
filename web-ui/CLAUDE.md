@@ -19,8 +19,8 @@ Keep this frontend deliberately minimal.
   `bunx shadcn@latest add <component>`.
 - Do not run `shadcn init`; this project is manually configured because
   shadcn does not detect Bun's native HTML setup.
-- Keep the frontend buildable as static assets. The production build will
-  eventually be embedded in the Rust binary.
+- Keep the frontend buildable as static assets. The production build is
+  embedded in the Rust binary (`dabmux/src/web_ui.rs`, served on `/`).
 
 ## Commands
 

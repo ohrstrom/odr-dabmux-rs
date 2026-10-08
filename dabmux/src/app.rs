@@ -9,6 +9,7 @@ use crate::api;
 use crate::args::Args;
 use crate::config::{self, SharedConfig};
 use crate::runtime::{self, RuntimeStats};
+use crate::web_ui;
 
 pub struct App {
     args: Args,
@@ -51,6 +52,7 @@ impl App {
     fn router(&self) -> Router {
         Router::new()
             .nest("/api", api::router())
+            .fallback(web_ui::serve)
             .with_state(self.state.clone())
             .layer(NormalizePathLayer::trim_trailing_slash())
     }
