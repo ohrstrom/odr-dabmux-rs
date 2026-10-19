@@ -706,6 +706,14 @@ impl ValidatedConfig {
     /// Suspicious but valid settings, logged when the configuration starts.
     pub fn warnings(&self) -> Vec<String> {
         let ensemble_ecc = self.source.ensemble.ecc;
+        let plan = crate::fic::FicPlan::new(self);
+        let overload = (!plan.within_rates).then(|| {
+            format!(
+                "the FIC cannot carry all labels and service information once per second: labels every {} ms, service information every {} ms",
+                plan.label_cycle * dabmux::frame::FRAME_PERIOD_MS,
+                plan.information_cycle * dabmux::frame::FRAME_PERIOD_MS
+            )
+        });
         self.source
             .services
             .iter()
@@ -718,6 +726,7 @@ impl ValidatedConfig {
                     service.id >> 24
                 )
             })
+            .chain(overload)
             .collect()
     }
 
@@ -788,6 +797,7 @@ impl ValidatedConfig {
             frequencies: &source.frequencies,
             service_changes: &source.service_changes,
             output: &source.output,
+            fic: crate::fic::FicPlan::new(self),
         }
     }
 }
@@ -801,6 +811,8 @@ pub struct ResolvedConfig<'a> {
     pub frequencies: &'a [linking::FrequencyInformation],
     pub service_changes: &'a [linking::ServiceChange],
     pub output: &'a EdiOutputConfig,
+    /// How the FIC capacity is shared.
+    pub fic: crate::fic::FicPlan,
 }
 
 #[derive(Debug, Serialize)]

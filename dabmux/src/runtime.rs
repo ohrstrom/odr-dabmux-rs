@@ -85,6 +85,14 @@ pub struct RuntimeStats {
     pub invalid_timestamps: AtomicU64,
     pub frame_errors: AtomicU64,
     pub clock_drift_ms: AtomicI64,
+    /// Latest measured FIC cycles, in milliseconds; 0 until measured.
+    pub fic_mci_cycle_ms: AtomicU64,
+    pub fic_label_cycle_ms: AtomicU64,
+    pub fic_information_cycle_ms: AtomicU64,
+    pub fic_rotation_cycle_ms: AtomicU64,
+    pub fic_database_cycle_ms: AtomicU64,
+    /// FIC cycles that took longer than the plan allows.
+    pub fic_late_cycles: AtomicU64,
     /// The latest frame, for live monitoring; published only while
     /// someone subscribes.
     pub live: watch::Sender<Option<Arc<LiveFrame>>>,
@@ -107,9 +115,27 @@ impl Default for RuntimeStats {
             invalid_timestamps: AtomicU64::default(),
             frame_errors: AtomicU64::default(),
             clock_drift_ms: AtomicI64::default(),
+            fic_mci_cycle_ms: AtomicU64::default(),
+            fic_label_cycle_ms: AtomicU64::default(),
+            fic_information_cycle_ms: AtomicU64::default(),
+            fic_rotation_cycle_ms: AtomicU64::default(),
+            fic_database_cycle_ms: AtomicU64::default(),
+            fic_late_cycles: AtomicU64::default(),
             live: watch::Sender::new(None),
         }
     }
+}
+
+fn log_fic_plan(config: &ValidatedConfig) {
+    let plan = fic::FicPlan::new(config);
+    tracing::info!(
+        load_permille = plan.load_permille,
+        mci_period_ms = plan.mci_period * FRAME_PERIOD_MS,
+        label_cycle_ms = plan.label_cycle * FRAME_PERIOD_MS,
+        information_cycle_ms = plan.information_cycle * FRAME_PERIOD_MS,
+        database_cycle_ms = plan.database_cycle * FRAME_PERIOD_MS,
+        "FIC plan"
+    );
 }
 
 /// The state of the mux at one frame.
@@ -183,7 +209,31 @@ impl RuntimeStats {
             invalid_timestamps: self.invalid_timestamps.load(Ordering::Relaxed),
             frame_errors: self.frame_errors.load(Ordering::Relaxed),
             clock_drift_ms: self.clock_drift_ms.load(Ordering::Relaxed),
+            fic_mci_cycle_ms: self.fic_mci_cycle_ms.load(Ordering::Relaxed),
+            fic_label_cycle_ms: self.fic_label_cycle_ms.load(Ordering::Relaxed),
+            fic_information_cycle_ms: self.fic_information_cycle_ms.load(Ordering::Relaxed),
+            fic_rotation_cycle_ms: self.fic_rotation_cycle_ms.load(Ordering::Relaxed),
+            fic_database_cycle_ms: self.fic_database_cycle_ms.load(Ordering::Relaxed),
+            fic_late_cycles: self.fic_late_cycles.load(Ordering::Relaxed),
         }
+    }
+
+    /// Publish the carousel's measured cycles and count its late ones.
+    fn record_fic(&self, carousel: &mut FicCarousel) {
+        let cycles = carousel.cycles();
+        for (cycle, stat) in [
+            (cycles.mci, &self.fic_mci_cycle_ms),
+            (cycles.labels, &self.fic_label_cycle_ms),
+            (cycles.shared, &self.fic_information_cycle_ms),
+            (cycles.rotation, &self.fic_rotation_cycle_ms),
+            (cycles.databases, &self.fic_database_cycle_ms),
+        ] {
+            if let Some(frames) = cycle {
+                stat.store(frames * FRAME_PERIOD_MS, Ordering::Relaxed);
+            }
+        }
+        self.fic_late_cycles
+            .fetch_add(carousel.take_late_cycles(), Ordering::Relaxed);
     }
 }
 
@@ -205,6 +255,17 @@ pub struct StatsSnapshot {
     invalid_timestamps: u64,
     frame_errors: u64,
     clock_drift_ms: i64,
+    /// Latest measured FIC cycles: the MCI, all labels, FIG 0/9 with the
+    /// slower FIG 0/8 and 0/13, the FIG 0/5, 0/17 and 0/20 rotation, and the
+    /// service following databases. The plan is in `/api/config/resolved`.
+    fic_mci_cycle_ms: u64,
+    fic_label_cycle_ms: u64,
+    fic_information_cycle_ms: u64,
+    fic_rotation_cycle_ms: u64,
+    fic_database_cycle_ms: u64,
+    /// MCI periods without a complete pass, and other FIC cycles longer than
+    /// planned.
+    fic_late_cycles: u64,
 }
 
 struct BufferedInput {
@@ -1385,6 +1446,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
     for warning in initial.warnings() {
         tracing::warn!("{warning}");
     }
+    log_fic_plan(&initial);
     let mut active = initial;
     let mut pending: Option<(ConfigUpdate, PreparedResources)> = None;
     // A reconfiguration announced in the FIC, and the frame it applies from.
@@ -1507,6 +1569,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                     for warning in candidate.warnings() {
                         tracing::warn!("{warning}");
                     }
+                    log_fic_plan(&candidate);
                     let reallocated = candidate.reallocated_subchannels(&active);
                     if !reallocated.is_empty() {
                         let changes = reallocated
@@ -1621,6 +1684,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
             let fragments = fragment_af(&packet, seq)?;
             Ok((packet, fragments))
         });
+        stats.record_fic(&mut carousel);
         match packet {
             Ok((packet, fragments)) => {
                 if frame_failing {

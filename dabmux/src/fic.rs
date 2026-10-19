@@ -1,34 +1,47 @@
 //! FIC carousel (EN 300 401 clauses 5.2, 6 and 8).
 //!
+//! The FIC carries 90 bytes per 24 ms frame (120 in mode III). Above about
+//! 20 services that is not enough for the MCI every 96 ms and all labels and
+//! service information every second, so a [`FicPlan`] derived from the
+//! configuration shares it out. The MCI keeps 96 ms where that fits;
+//! otherwise it takes the shortest multiple of 96 ms, up to 384 ms, that
+//! leaves the once-per-second FIGs their rate (clause 6.1 asks for 96 ms
+//! "normally"). Only beyond that do the once-per-second FIGs slow down too.
+//!
 //! Each frame is filled in priority order:
 //!
 //! 1. FIG 0/0, then FIG 0/7, open the first FIB of each transmission frame
 //!    (clause 6.4).
-//! 2. FIG 0/10 every 96 ms, and one label (FIG 1/0, 1/1 or 1/5) per frame,
-//!    placed in the last FIB with room.
-//! 3. One complete pass of the MCI (FIG 0/1, 0/2, 0/3 and 0/14) per 96 ms,
-//!    as clause 6.1 requires.
-//! 4. The service following databases (FIG 0/6, 0/21, 0/24) get a steady
-//!    share of the remaining space: each entry within 10 s, as TS 103 176
-//!    asks, without starving the faster information.
-//! 5. All remaining space carries FIG 0/5, 0/8, 0/9, 0/13, 0/17 and 0/20, and
-//!    change indications for five seconds after a reload, in rotation; each
-//!    must repeat at least once per second.
+//! 2. FIG 0/10 once per second, and the labels (FIG 1/0, 1/1, 1/5), paced so
+//!    that all of them take the planned label cycle, in the last FIB with
+//!    room.
+//! 3. Steady shares, from the last FIB backwards: FIG 0/9 with the FIG 0/8
+//!    and 0/13 that may follow at the slower rate (clause 6.1), each within a
+//!    second; and the service following databases (FIG 0/6, 0/21, 0/24),
+//!    each entry within 10 s as TS 103 176 asks.
+//! 4. One complete pass of the MCI (FIG 0/1, 0/2, 0/3, 0/14, and FIG 0/8 of
+//!    secondary audio components) per planned MCI period.
+//! 5. All remaining space carries FIG 0/5, 0/17 and 0/20, and change
+//!    indications for five seconds after a reload, in rotation.
+//!
+//! The carousel measures how long each of these takes for a full cycle;
+//! the runtime reports it in the stats.
 //!
 //! While a multiplex reconfiguration is announced (clause 6.5), FIG 0/0
 //! carries the change flags and occurrence change, the MCI pass also carries
-//! the next configuration's FIG 0/1, 0/2, 0/3, 0/7 and 0/14 with C/N = 1, and
-//! the rotation its FIG 0/8 and 0/13.
+//! the next configuration's FIG 0/1, 0/2, 0/3, 0/7, 0/8 and 0/14 with C/N = 1
+//! within twice the MCI period, and the slower share its FIG 0/8 and 0/13.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Result};
+use serde::Serialize;
 
 use crate::config::{
     encode_label, short_label_mask, SubchannelKind, UserApplication, ValidatedConfig,
 };
-use dabmux::frame::{cifs_per_transmission_frame, FrameClock};
+use dabmux::frame::{cifs_per_transmission_frame, FrameClock, FRAME_PERIOD_MS};
 
 /// FIG 0/13 user application types (TS 101 756 table 16).
 const USER_APPLICATION_SLIDESHOW: u16 = 0x002;
@@ -41,18 +54,30 @@ const DSCTY_MOT: u8 = 60;
 const SPI_PROFILE_BASIC: u8 = 0x01;
 /// FIG 0/14 FEC scheme of EN 300 401 clause 5.3.5.
 const FEC_SCHEME_RS: u8 = 1;
-/// Frames per MCI repetition period (96 ms).
+/// Frames per nominal MCI repetition period (96 ms, clause 6.1).
 const MCI_PERIOD_FRAMES: u64 = 4;
-/// Frames per MCI repetition period while a reconfiguration is announced:
-/// the next MCI within two 96 ms periods, and the current one only once in
-/// that time (clause 6.1).
-const ANNOUNCED_MCI_PERIOD_FRAMES: u64 = 8;
+/// The longest MCI period the plan uses before it slows down the
+/// once-per-second FIGs as well (384 ms).
+const MAX_MCI_PERIOD_FRAMES: u64 = 16;
 const FIB_DATA_BYTES: usize = 30;
-/// Bytes per frame credited to the database rotation, about 170 bytes/s.
-/// Credit accumulates up to a whole FIB so that large fields fit.
-const DATABASE_BYTES_PER_FRAME: usize = 4;
-/// Frames for one cycle of all labels, just under the required second.
+/// Frames per FIG 0/10: once per second.
+const TIME_FRAMES: u64 = 40;
+/// Once-per-second information must repeat within 41 frames (984 ms).
+const SECOND_FRAMES: u64 = 41;
+/// Planned cycle of all labels, just under the required second.
 const LABEL_CYCLE_FRAMES: u64 = 40;
+/// Planned cycle of the once-per-second shares, with room for jitter.
+const SHARE_CYCLE_FRAMES: u64 = 36;
+/// Planned cycle of the service following databases (8 s), and their
+/// limit (10 s, TS 103 176).
+const DATABASE_CYCLE_FRAMES: u64 = 333;
+const DATABASE_LIMIT_FRAMES: u64 = 417;
+/// The database share takes at most this many bytes per frame.
+const MAX_DATABASE_BYTES_PER_FRAME: usize = 8;
+/// Share of the FIC the plan may fill, and the allowance for FIGs that do
+/// not fit the end of a partly filled FIB.
+const PLANNED_LOAD: f64 = 0.92;
+const PACKING_OVERHEAD: f64 = 1.05;
 /// The occurrence change holds the lower part of the CIF count, so it
 /// addresses at most 249 CIFs ahead (clauses 6.4.1 and 6.5).
 pub const MAX_ANNOUNCEMENT_FRAMES: u64 = 249;
@@ -62,17 +87,175 @@ const NEXT: u8 = 0x80;
 mod database;
 pub use database::DatabaseEvents;
 
+/// How a configuration shares the FIC. Durations are in frames and
+/// reported in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FicPlan {
+    /// FIC bytes per 24 ms frame.
+    pub capacity_bytes: usize,
+    /// Planned use of the capacity, in per mille.
+    pub load_permille: u32,
+    /// One complete MCI pass per period: 96 ms where it fits.
+    #[serde(rename = "mci_period_ms", serialize_with = "frames_as_ms")]
+    pub mci_period: u64,
+    /// All labels once per cycle.
+    #[serde(rename = "label_cycle_ms", serialize_with = "frames_as_ms")]
+    pub label_cycle: u64,
+    /// FIG 0/9 and the slower FIG 0/8 and 0/13 once per cycle; FIG 0/5,
+    /// 0/17 and 0/20 rotate in the remaining space at least as often.
+    #[serde(rename = "information_cycle_ms", serialize_with = "frames_as_ms")]
+    pub information_cycle: u64,
+    pub information_bytes_per_frame: usize,
+    /// The service following databases once per cycle.
+    #[serde(rename = "database_cycle_ms", serialize_with = "frames_as_ms")]
+    pub database_cycle: u64,
+    pub database_bytes_per_frame: usize,
+    /// Whether labels and service information repeat within a second, as
+    /// EN 300 401 requires.
+    pub within_rates: bool,
+}
+
+fn frames_as_ms<S: serde::Serializer>(frames: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_u64(frames * FRAME_PERIOD_MS)
+}
+
+impl FicPlan {
+    pub fn new(config: &ValidatedConfig) -> Self {
+        let ensemble = &config.source.ensemble;
+        let capacity_bytes = fib_count(ensemble.mode) * FIB_DATA_BYTES;
+        let per_frame = |bytes: usize, frames: u64| bytes as f64 * PACKING_OVERHEAD / frames as f64;
+        let ensemble_information = 6 + if ensemble.reconfiguration_counter.is_some() {
+            4
+        } else {
+            0
+        };
+        let fixed = per_frame(
+            ensemble_information,
+            cifs_per_transmission_frame(ensemble.mode),
+        ) + per_frame(8, TIME_FRAMES);
+        let clock = FrameClock::new(0, 0, 0).expect("frame zero");
+        let mci = pass_bytes(&mci_groups(config));
+        let labels = labels(config).1;
+        let shared = pass_bytes(&share_groups(config, clock));
+        let mut rotation = information_groups(config);
+        rotation.extend(database::sci_groups(&config.databases));
+        let rotation = pass_bytes(&rotation);
+        let database = pass_bytes(&database::definition_groups(
+            &config.databases,
+            &database::Withheld::default(),
+        ));
+        let database_bytes_per_frame = if database == 0 {
+            0
+        } else {
+            (per_frame(database, DATABASE_CYCLE_FRAMES).ceil() as usize)
+                .clamp(1, MAX_DATABASE_BYTES_PER_FRAME)
+        };
+        let budget = capacity_bytes as f64 * PLANNED_LOAD - fixed - database_bytes_per_frame as f64;
+        // What the once-per-second FIGs need at their nominal cycles.
+        let second = per_frame(labels, LABEL_CYCLE_FRAMES)
+            + per_frame(shared + rotation, SHARE_CYCLE_FRAMES);
+        let mci_period = (1..=MAX_MCI_PERIOD_FRAMES / MCI_PERIOD_FRAMES)
+            .map(|n| n * MCI_PERIOD_FRAMES)
+            .find(|period| per_frame(mci, *period) + second <= budget)
+            .unwrap_or(MAX_MCI_PERIOD_FRAMES);
+        let room = budget - per_frame(mci, mci_period);
+        // Beyond the longest MCI period, everything else slows down evenly.
+        let stretch = if room > 0.0 {
+            (second / room).clamp(1.0, 100.0)
+        } else {
+            100.0
+        };
+        let cycle = |frames: u64| (frames as f64 * stretch).ceil() as u64;
+        let information_cycle = cycle(SHARE_CYCLE_FRAMES);
+        let demand =
+            fixed + database_bytes_per_frame as f64 + per_frame(mci, mci_period) + second / stretch;
+        Self {
+            capacity_bytes,
+            load_permille: (demand / capacity_bytes as f64 * 1000.0).round() as u32,
+            mci_period,
+            label_cycle: cycle(LABEL_CYCLE_FRAMES),
+            information_cycle,
+            information_bytes_per_frame: per_frame(shared, information_cycle).ceil() as usize,
+            database_cycle: if database_bytes_per_frame == 0 {
+                0
+            } else {
+                (per_frame(database, 1) / database_bytes_per_frame as f64).ceil() as u64
+            },
+            database_bytes_per_frame,
+            within_rates: stretch <= 1.0,
+        }
+    }
+
+    /// The longest measured cycles that still meet the plan.
+    fn label_limit(&self) -> u64 {
+        (self.label_cycle + 1).max(SECOND_FRAMES)
+    }
+
+    fn information_limit(&self) -> u64 {
+        self.information_cycle + SECOND_FRAMES - SHARE_CYCLE_FRAMES
+    }
+
+    fn database_limit(&self) -> u64 {
+        self.database_cycle.max(DATABASE_LIMIT_FRAMES)
+    }
+}
+
+/// The latest measured cycle of each part of the FIC, in frames: from one
+/// completed pass to the next.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FicCycles {
+    pub mci: Option<u64>,
+    pub labels: Option<u64>,
+    /// FIG 0/9 and the slower FIG 0/8 and 0/13.
+    pub shared: Option<u64>,
+    /// FIG 0/5, 0/17 and 0/20.
+    pub rotation: Option<u64>,
+    pub databases: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct Cycle {
+    since: Option<u64>,
+}
+
+impl Cycle {
+    /// Record a completed pass in frame `count`; counts a cycle longer than
+    /// `limit` frames as late.
+    fn complete(&mut self, count: u64, limit: u64, last: &mut Option<u64>, late: &mut u64) {
+        if let Some(since) = self.since {
+            let cycle = (count - since).max(1);
+            if cycle > limit {
+                *late += 1;
+            }
+            *last = Some(cycle);
+        }
+        self.since = Some(count);
+    }
+}
+
 pub struct FicCarousel {
+    /// Derived from the configuration on the first frame.
+    plan: Option<FicPlan>,
+    /// First frame this carousel wrote.
+    started: Option<u64>,
     mci: Cursor,
     /// First frame of the MCI repetition period whose pass has been sent.
     mci_sent_for: Option<u64>,
+    /// The MCI repetition period under way, and its length in frames.
+    mci_period: Option<(u64, u64)>,
     time_due: bool,
     label_cursor: usize,
-    /// Frame count from which the next label may be sent.
-    label_due: u64,
-    information: Cursor,
+    /// Labels due, in units of one label cycle per label.
+    label_credit: u64,
+    shared: Cursor,
+    shared_credit: usize,
+    rotation: Cursor,
     database: Cursor,
     database_credit: usize,
+    cycles: FicCycles,
+    measured: [Cycle; 5],
+    /// Cycles that took longer than planned, not yet reported.
+    late: u64,
     events: DatabaseEvents,
     /// Frame count until which `events` are signalled.
     events_until: u64,
@@ -98,14 +281,22 @@ impl Default for FicCarousel {
 impl FicCarousel {
     pub fn new() -> Self {
         Self {
+            plan: None,
+            started: None,
             mci: Cursor::default(),
             mci_sent_for: None,
-            time_due: false,
+            mci_period: None,
+            time_due: true,
             label_cursor: 0,
-            label_due: 0,
-            information: Cursor::default(),
+            label_credit: u64::MAX,
+            shared: Cursor::default(),
+            shared_credit: 0,
+            rotation: Cursor::default(),
             database: Cursor::default(),
             database_credit: 0,
+            cycles: FicCycles::default(),
+            measured: Default::default(),
+            late: 0,
             events: DatabaseEvents::default(),
             events_until: 0,
             reconfiguration_counter: None,
@@ -164,10 +355,23 @@ impl FicCarousel {
         self
     }
 
+    /// The latest measured cycles.
+    pub fn cycles(&self) -> FicCycles {
+        self.cycles
+    }
+
+    /// Cycles that took longer than planned since the last call: an MCI
+    /// period without a complete pass, or a later label, information or
+    /// database cycle.
+    pub fn take_late_cycles(&mut self) -> u64 {
+        std::mem::take(&mut self.late)
+    }
+
     pub fn write(&mut self, config: &ValidatedConfig, clock: FrameClock) -> Result<Vec<u8>> {
+        let plan = *self.plan.get_or_insert_with(|| FicPlan::new(config));
+        let started = *self.started.get_or_insert(clock.count);
         let mode = config.source.ensemble.mode;
-        let fib_count = if mode == 3 { 4 } else { 3 };
-        let mut fibs = vec![Fib::default(); fib_count];
+        let mut fibs = vec![Fib::default(); fib_count(mode)];
 
         if clock
             .count
@@ -183,8 +387,8 @@ impl FicCarousel {
             }
         }
 
-        // Small, timed FIGs first; MCI then has the rest of the 96 ms period.
-        if clock.count.is_multiple_of(MCI_PERIOD_FRAMES) {
+        // Small, timed FIGs first.
+        if clock.count.is_multiple_of(TIME_FRAMES) {
             self.time_due = true;
         }
         if self.time_due {
@@ -193,41 +397,53 @@ impl FicCarousel {
                 self.time_due = false;
             }
         }
-        // Labels are paced so that the full set takes about a second: more
-        // often only wastes FIC capacity.
-        let labels = 1 + config.source.services.len() + config.databases.labels.len();
-        let pace = (LABEL_CYCLE_FRAMES / labels as u64).max(1);
-        let label = self.label(config);
-        if clock.count >= self.label_due {
-            if let Some(fib) = fibs.iter_mut().rev().find(|fib| fib.room() >= label.len()) {
-                fib.push(&label)?;
-                self.label_cursor = (self.label_cursor + 1) % labels;
-                self.label_due = clock.count + pace;
+        // Each frame earns one label cycle's worth of credit per label, so
+        // all labels take the planned cycle; sending them more often only
+        // takes space from the rest.
+        let (labels, _) = labels(config);
+        self.label_credit = self
+            .label_credit
+            .saturating_add(labels as u64)
+            .min(plan.label_cycle + labels as u64);
+        while self.label_credit >= plan.label_cycle {
+            let label = self.label(config);
+            let Some(fib) = fibs.iter_mut().rev().find(|fib| fib.room() >= label.len()) else {
+                break;
+            };
+            fib.push(&label)?;
+            self.label_credit -= plan.label_cycle;
+            self.label_cursor = (self.label_cursor + 1) % labels;
+            if self.label_cursor == 0 {
+                self.measured[1].complete(
+                    clock.count,
+                    plan.label_limit(),
+                    &mut self.cycles.labels,
+                    &mut self.late,
+                );
             }
         }
 
-        let next = self.announcing(clock.count);
-        let period_frames = if next.is_some() {
-            ANNOUNCED_MCI_PERIOD_FRAMES
-        } else {
-            MCI_PERIOD_FRAMES
-        };
-        let period = clock.count / period_frames * period_frames;
-        if self.mci_sent_for != Some(period) {
-            // Next after current, so that a pass under way when the
-            // announcement starts keeps its place.
-            let mut groups = mci_groups(config);
-            if let Some(next) = next {
-                groups.extend(next.mci.iter().cloned());
-            }
-            for fib in &mut fibs {
-                if fill(fib, &groups, &mut self.mci, Fill::OnePass)? {
-                    self.mci_sent_for = Some(period);
-                    break;
-                }
-            }
+        // Steady shares, before the MCI takes what it needs of the rest.
+        let mut shared = share_groups(config, clock);
+        let mut shared_bytes = plan.information_bytes_per_frame;
+        if let Some(next) = self.announcing(clock.count) {
+            shared.extend(next.applications.iter().cloned());
+            shared_bytes *= 2;
         }
-
+        if fill_share(
+            &mut fibs,
+            &shared,
+            &mut self.shared,
+            &mut self.shared_credit,
+            shared_bytes,
+        )? {
+            self.measured[2].complete(
+                clock.count,
+                plan.information_limit(),
+                &mut self.cycles.shared,
+                &mut self.late,
+            );
+        }
         let events_active = clock.count < self.events_until && !self.events.is_empty();
         let no_events = database::Withheld::default();
         let withheld = if events_active {
@@ -236,31 +452,80 @@ impl FicCarousel {
             &no_events
         };
         let definitions = database::definition_groups(&config.databases, withheld);
-        if !definitions.is_empty() {
-            self.database_credit =
-                (self.database_credit + DATABASE_BYTES_PER_FRAME).min(FIB_DATA_BYTES);
-            for fib in fibs.iter_mut().rev() {
-                let before = fib.used;
-                fib.cap = (fib.used + self.database_credit).min(FIB_DATA_BYTES);
-                fill(fib, &definitions, &mut self.database, Fill::Repeat)?;
-                fib.cap = FIB_DATA_BYTES;
-                self.database_credit -= fib.used - before;
+        if fill_share(
+            &mut fibs,
+            &definitions,
+            &mut self.database,
+            &mut self.database_credit,
+            plan.database_bytes_per_frame,
+        )? {
+            self.measured[4].complete(
+                clock.count,
+                plan.database_limit(),
+                &mut self.cycles.databases,
+                &mut self.late,
+            );
+        }
+
+        // While a reconfiguration is announced, the current and the next
+        // MCI share twice the period (clause 6.1).
+        let period_frames = if self.announcing(clock.count).is_some() {
+            2 * plan.mci_period
+        } else {
+            plan.mci_period
+        };
+        let period = clock.count / period_frames * period_frames;
+        if self.mci_period != Some((period, period_frames)) {
+            if let Some((previous, frames)) = self.mci_period {
+                let measured = frames == period_frames && previous >= started;
+                if measured && self.mci_sent_for != Some(previous) {
+                    self.late += 1;
+                }
+            }
+            self.mci_period = Some((period, period_frames));
+        }
+        if self.mci_sent_for != Some(period) {
+            // Next after current, so that a pass under way when the
+            // announcement starts keeps its place.
+            let mut groups = mci_groups(config);
+            if let Some(next) = self.announcing(clock.count) {
+                groups.extend(next.mci.iter().cloned());
+            }
+            for fib in &mut fibs {
+                if fill(fib, &groups, &mut self.mci, Fill::OnePass)? {
+                    self.mci_sent_for = Some(period);
+                    self.measured[0].complete(
+                        clock.count,
+                        u64::MAX,
+                        &mut self.cycles.mci,
+                        &mut self.late,
+                    );
+                    break;
+                }
             }
         }
 
-        let mut groups = information_groups(config, clock);
-        groups.extend(database::sci_groups(&config.databases));
+        let mut rotation = information_groups(config);
+        rotation.extend(database::sci_groups(&config.databases));
         if events_active {
-            groups.extend(self.events.groups().iter().cloned());
+            rotation.extend(self.events.groups().iter().cloned());
         }
-        if let Some(next) = self.announcing(clock.count) {
-            groups.extend(next.applications.iter().cloned());
-        }
-        for fib in &mut fibs {
-            fill(fib, &groups, &mut self.information, Fill::Repeat)?;
+        if has_entries(&rotation) {
+            let mut ended = false;
+            for fib in &mut fibs {
+                ended |= fill(fib, &rotation, &mut self.rotation, Fill::Repeat)?;
+            }
+            if ended {
+                self.measured[3].complete(
+                    clock.count,
+                    plan.information_limit(),
+                    &mut self.cycles.rotation,
+                    &mut self.late,
+                );
+            }
         }
 
-        let mut output = Vec::with_capacity(fib_count * 32);
+        let mut output = Vec::with_capacity(fibs.len() * 32);
         for fib in fibs {
             output.extend_from_slice(&fib.finish());
         }
@@ -310,6 +575,28 @@ impl FicCarousel {
             )
         }
     }
+}
+
+fn fib_count(mode: u8) -> usize {
+    if mode == 3 {
+        4
+    } else {
+        3
+    }
+}
+
+/// The number of labels, and their bytes: the ensemble's, the services',
+/// and those of services announced in other ensembles. A FIG 1 label is
+/// 22 bytes with a 16-bit and 24 with a 32-bit identifier.
+fn labels(config: &ValidatedConfig) -> (usize, usize) {
+    let size = |data: bool| if data { 24 } else { 22 };
+    let services = config.services.iter().map(|service| size(service.data));
+    let announced = config.databases.labels.iter().map(|label| size(label.data));
+    let bytes = 22 + services.chain(announced).sum::<usize>();
+    (
+        1 + config.services.len() + config.databases.labels.len(),
+        bytes,
+    )
 }
 
 #[derive(Clone)]
@@ -388,9 +675,61 @@ enum Fill {
     Repeat,
 }
 
-/// Pack entries from `cursor` into `fib` until it is full.
+fn has_entries(groups: &[Group]) -> bool {
+    groups.iter().any(|group| !group.entries.is_empty())
+}
+
+/// The bytes of one pass of `groups` packed into empty FIBs: the entries
+/// plus a two-byte header per FIG.
+fn pass_bytes(groups: &[Group]) -> usize {
+    let mut total = 0;
+    for group in groups {
+        let mut fig = 0;
+        for entry in &group.entries {
+            if fig > 0 && fig + entry.len() > FIB_DATA_BYTES {
+                total += fig;
+                fig = 0;
+            }
+            if fig == 0 {
+                fig = 2;
+            }
+            fig += entry.len();
+        }
+        total += fig;
+    }
+    total
+}
+
+/// Fill `groups` from the last FIB backwards, using at most the credit that
+/// `per_frame` bytes a frame have earned. Credit accumulates while unused,
+/// up to a FIB or two frames' worth, so that large entries fit. Returns
+/// whether a pass ended.
+fn fill_share(
+    fibs: &mut [Fib],
+    groups: &[Group],
+    cursor: &mut Cursor,
+    credit: &mut usize,
+    per_frame: usize,
+) -> Result<bool> {
+    if !has_entries(groups) {
+        return Ok(false);
+    }
+    *credit = (*credit + per_frame).min(FIB_DATA_BYTES.max(2 * per_frame));
+    let mut ended = false;
+    for fib in fibs.iter_mut().rev() {
+        let before = fib.used;
+        fib.cap = (fib.used + *credit).min(FIB_DATA_BYTES);
+        ended |= fill(fib, groups, cursor, Fill::Repeat)?;
+        fib.cap = FIB_DATA_BYTES;
+        *credit -= fib.used - before;
+    }
+    Ok(ended)
+}
+
+/// Pack entries from `cursor` into `fib` until it is full, or the pass ends
+/// for `Fill::OnePass`. Returns whether the end of the pass was reached.
 fn fill(fib: &mut Fib, groups: &[Group], cursor: &mut Cursor, mode: Fill) -> Result<bool> {
-    if groups.iter().all(|group| group.entries.is_empty()) {
+    if !has_entries(groups) {
         *cursor = Cursor::default();
         return Ok(true);
     }
@@ -413,7 +752,7 @@ fn fill(fib: &mut Fib, groups: &[Group], cursor: &mut Cursor, mode: Fill) -> Res
             continue;
         }
         if wrapped && *cursor >= start {
-            return Ok(false);
+            return Ok(true);
         }
         let group = &groups[cursor.group];
         let first = &group.entries[cursor.entry];
@@ -421,7 +760,7 @@ fn fill(fib: &mut Fib, groups: &[Group], cursor: &mut Cursor, mode: Fill) -> Res
             bail!("FIG 0/{} entry does not fit a FIB", group.extension & 0x1f);
         }
         if fib.room() < first.len() + 2 {
-            return Ok(false);
+            return Ok(wrapped);
         }
         let mut fig = vec![0, group.extension];
         while let Some(entry) = group.entries.get(cursor.entry) {
@@ -519,11 +858,14 @@ fn mci_groups(config: &ValidatedConfig) -> Vec<Group> {
         .filter(|(_, raw)| raw.kind == SubchannelKind::EnhancedPacket)
         .map(|(sub, _)| vec![(sub.id << 2) | FEC_SCHEME_RS])
         .collect();
+    let ([programme_definitions, data_definitions], _) = component_definitions(config);
     vec![
         Group::new(1, false, subchannels),
         Group::new(2, false, programme),
         Group::new(2, true, data),
         Group::new(3, false, packet_components),
+        Group::new(8, false, programme_definitions),
+        Group::new(8, true, data_definitions),
         Group::new(14, false, fec),
     ]
 }
@@ -537,8 +879,16 @@ pub fn reconfigures(active: &ValidatedConfig, candidate: &ValidatedConfig) -> bo
         || application_groups(active) != application_groups(candidate)
 }
 
-/// FIG 0/5, 0/17, 0/9, 0/13 and 0/8, the latter two split by P/D.
-fn information_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group> {
+/// The once-per-second share: FIG 0/9, then the FIG 0/13 and 0/8 that may
+/// follow at the slower rate.
+fn share_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group> {
+    let mut groups = vec![Group::new(9, false, vec![fig0_9_entry(config, clock)])];
+    groups.extend(application_groups(config));
+    groups
+}
+
+/// FIG 0/5 and 0/17, for the rotation.
+fn information_groups(config: &ValidatedConfig) -> Vec<Group> {
     let source = &config.source;
     // One FIG 0/5 entry per audio subchannel; validation rejects conflicts.
     let mut signalled = HashSet::new();
@@ -562,33 +912,32 @@ fn information_groups(config: &ValidatedConfig, clock: FrameClock) -> Vec<Group>
             vec![high, low, 0, service.pty]
         })
         .collect();
-    let mut groups = vec![
+    vec![
         Group::new(5, false, languages),
         Group::new(17, false, programme_types),
-        Group::new(9, false, vec![fig0_9_entry(config, clock)]),
-    ];
-    groups.extend(application_groups(config));
-    groups
+    ]
 }
 
-/// FIG 0/13 and 0/8, each split by P/D: the part of the MCI that may be
-/// signalled at the slower rate (clause 6.1).
+fn sid_bytes(config: &ValidatedConfig, service: usize) -> Vec<u8> {
+    let id = config.source.services[service].id;
+    if config.services[service].data {
+        id.to_be_bytes().to_vec()
+    } else {
+        (id as u16).to_be_bytes().to_vec()
+    }
+}
+
+/// FIG 0/13 and the FIG 0/8 of [`component_definitions`] that may follow
+/// at the slower rate, each split by P/D: the part of the MCI that may be
+/// signalled less often than every 96 ms (clause 6.1).
 fn application_groups(config: &ValidatedConfig) -> Vec<Group> {
     let source = &config.source;
-    let sid = |index: usize| -> Vec<u8> {
-        if config.services[index].data {
-            source.services[index].id.to_be_bytes().to_vec()
-        } else {
-            (source.services[index].id as u16).to_be_bytes().to_vec()
-        }
-    };
     let mut applications = [Vec::new(), Vec::new()];
-    let mut definitions = [Vec::new(), Vec::new()];
     for (component, raw) in config.components.iter().zip(&source.components) {
         let data = config.services[component.service].data;
         let audio = source.subchannels[component.subchannel].kind.is_audio();
         if !raw.user_applications.is_empty() {
-            let mut entry = sid(component.service);
+            let mut entry = sid_bytes(config, component.service);
             entry.push(component.scids << 4 | raw.user_applications.len() as u8);
             for application in &raw.user_applications {
                 // X-PAD data for applications in an audio component's PAD.
@@ -606,26 +955,47 @@ fn application_groups(config: &ValidatedConfig) -> Vec<Group> {
             }
             applications[usize::from(data)].push(entry);
         }
-        // Required for secondary components and for components with user
-        // applications (clause 6.3.5).
-        if component.scids > 0 || !raw.user_applications.is_empty() {
-            let mut entry = sid(component.service);
-            entry.push(component.scids & 0x0f);
-            match component.scid {
-                Some(scid) => entry.extend_from_slice(&[0x80 | (scid >> 8) as u8, scid as u8]),
-                None => entry.push(config.subchannels[component.subchannel].id & 0x3f),
-            }
-            definitions[usize::from(data)].push(entry);
-        }
     }
     let [programme_applications, data_applications] = applications;
-    let [programme_definitions, data_definitions] = definitions;
+    let (_, [programme_definitions, data_definitions]) = component_definitions(config);
     vec![
         Group::new(13, false, programme_applications),
         Group::new(13, true, data_applications),
         Group::new(8, false, programme_definitions),
         Group::new(8, true, data_definitions),
     ]
+}
+
+/// FIG 0/8 entries, by P/D, for the components that need one: secondary
+/// components and components with user applications (clause 6.3.5). The
+/// first pair, for secondary audio components, belongs to the 96 ms MCI;
+/// the second, for primary components with data applications and data
+/// secondary components, may follow at the slower rate (clause 6.1).
+type Definitions = [Vec<Vec<u8>>; 2];
+
+fn component_definitions(config: &ValidatedConfig) -> (Definitions, Definitions) {
+    let source = &config.source;
+    let mut mci: Definitions = Default::default();
+    let mut slower: Definitions = Default::default();
+    for (component, raw) in config.components.iter().zip(&source.components) {
+        if component.scids == 0 && raw.user_applications.is_empty() {
+            continue;
+        }
+        let mut entry = sid_bytes(config, component.service);
+        entry.push(component.scids & 0x0f);
+        match component.scid {
+            Some(scid) => entry.extend_from_slice(&[0x80 | (scid >> 8) as u8, scid as u8]),
+            None => entry.push(config.subchannels[component.subchannel].id & 0x3f),
+        }
+        let data = usize::from(config.services[component.service].data);
+        let audio = source.subchannels[component.subchannel].kind.is_audio();
+        if component.scids > 0 && audio {
+            mci[data].push(entry);
+        } else {
+            slower[data].push(entry);
+        }
+    }
+    (mci, slower)
 }
 
 /// FIG 0/0; `next_at` announces the frame count from which the next
@@ -1048,6 +1418,13 @@ mod tests {
             keys.insert(format!("0/2 {sid}"));
         }
         for (component, raw) in config.components.iter().zip(&config.source.components) {
+            let audio = config.source.subchannels[component.subchannel]
+                .kind
+                .is_audio();
+            if component.scids > 0 && audio {
+                let sid = hex(&sid_bytes(config, component.service));
+                keys.insert(format!("0/8 {sid}/{}", component.scids));
+            }
             if raw.packet.is_some() {
                 keys.insert(format!("0/3 {}", component.scid.unwrap()));
                 keys.insert(format!(
@@ -1059,16 +1436,130 @@ mod tests {
         keys
     }
 
+    /// `count` DAB+ services with slideshow, PTY and language, at `bitrate`.
+    fn ensemble(count: usize, bitrate: u16) -> ValidatedConfig {
+        let mut config = example();
+        config.services.clear();
+        for index in 0..count {
+            let mut component = dab_plus(bitrate, &format!("tcp://:{}", 20000 + index));
+            component.subchannel_id = Some(index as u8 + 1);
+            component.user_applications = vec![UserApplication::Slideshow];
+            let label = format!("Station {index:02}");
+            let mut station = service(0xc100 + index as u32, &label, vec![component]);
+            station.pty = 10;
+            station.language = 9;
+            config.services.push(station);
+        }
+        config.validate().unwrap()
+    }
+
+    /// `example()` with a second audio component, whose FIG 0/8 is MCI.
+    fn secondary_audio() -> ValidatedConfig {
+        let mut config = example();
+        let mut second = dab_plus(64, "udp://127.0.0.1:9002");
+        second.subchannel_id = Some(2);
+        config.services[0].components.push(second);
+        config.validate().unwrap()
+    }
+
     #[test]
-    fn mci_is_complete_in_every_96_ms_period() {
-        for config in [example().validate().unwrap(), mux_zh()] {
+    fn mci_is_complete_in_every_planned_period() {
+        for (config, period) in [
+            (example().validate().unwrap(), 4),
+            (secondary_audio(), 4),
+            (mux_zh(), 4),
+            (ensemble(30, 32), 8),
+            (ensemble(50, 16), 16),
+        ] {
+            assert_eq!(FicPlan::new(&config).mci_period, period);
             let expected = expected_mci(&config);
-            for (period, frames) in run(&config, 400).chunks(4).enumerate() {
+            for (index, frames) in run(&config, 800).chunks(period as usize).enumerate() {
                 let sent: HashSet<String> = frames.iter().flatten().flat_map(entries).collect();
                 let missing: Vec<_> = expected.difference(&sent).collect();
-                assert!(missing.is_empty(), "period {period} misses {missing:?}");
+                assert!(missing.is_empty(), "period {index} misses {missing:?}");
             }
         }
+    }
+
+    #[test]
+    fn plan_relaxes_the_mci_before_the_once_per_second_information() {
+        let plans: Vec<_> = [(12, 64), (24, 32), (30, 32), (40, 16), (50, 16)]
+            .into_iter()
+            .map(|(count, bitrate)| {
+                let plan = FicPlan::new(&ensemble(count, bitrate));
+                (plan.mci_period, plan.label_cycle, plan.within_rates)
+            })
+            .collect();
+        assert_eq!(
+            plans,
+            [
+                (4, 40, true),
+                (8, 40, true),
+                (8, 40, true),
+                (12, 40, true),
+                (16, 46, false)
+            ]
+        );
+        let overloaded = ensemble(50, 16).warnings();
+        assert!(overloaded
+            .iter()
+            .any(|w| w.contains("labels every 1104 ms")));
+        assert!(ensemble(40, 16).warnings().is_empty());
+        let resolved = serde_json::to_value(ensemble(30, 32).resolved()).unwrap();
+        assert_eq!(resolved["fic"]["mci_period_ms"], 192);
+        assert_eq!(resolved["fic"]["label_cycle_ms"], 960);
+    }
+
+    #[test]
+    fn large_ensembles_meet_their_plan() {
+        for config in [ensemble(30, 32), ensemble(50, 16)] {
+            let plan = FicPlan::new(&config);
+            let mut carousel = FicCarousel::new();
+            let mut seen: HashMap<String, Vec<u64>> = HashMap::new();
+            for count in 0..2000 {
+                let clock = FrameClock::new(count, 1_704_164_645, 0).unwrap();
+                for fig in figs(&carousel.write(&config, clock).unwrap()).concat() {
+                    for key in entries(&fig) {
+                        seen.entry(key).or_default().push(count);
+                    }
+                }
+                assert_eq!(
+                    carousel.take_late_cycles(),
+                    0,
+                    "late cycle in frame {count}"
+                );
+            }
+            for (key, frames) in &seen {
+                let limit = match key.split(' ').next().unwrap() {
+                    "0/0" | "0/1" | "0/2" => plan.mci_period + 1,
+                    "1/0" | "1/1" => plan.label_limit(),
+                    "0/10" => TIME_FRAMES,
+                    _ => plan.information_limit(),
+                };
+                let gaps =
+                    std::iter::once(frames[0] + 1).chain(frames.windows(2).map(|w| w[1] - w[0]));
+                let worst = gaps.max().unwrap();
+                assert!(worst <= limit, "{key} repeats only every {worst} frames");
+            }
+            let cycles = carousel.cycles();
+            // Passes end anywhere in their period, so up to two periods apart.
+            assert!(cycles.mci.is_some_and(|cycle| cycle < 2 * plan.mci_period));
+            assert_eq!(cycles.labels, Some(plan.label_cycle));
+            assert!(cycles.shared.unwrap() <= plan.information_limit());
+        }
+    }
+
+    #[test]
+    fn time_is_sent_once_per_second() {
+        let frames = run(&mux_zh(), 400);
+        let sent: Vec<usize> = (0..frames.len())
+            .filter(|&index| {
+                frames[index]
+                    .iter()
+                    .any(|fig| (fig.kind, fig.extension) == (0, 10))
+            })
+            .collect();
+        assert_eq!(sent, (0..400).step_by(40).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1403,7 +1894,8 @@ output: {destinations: [{protocol: tcp, listen_port: 8850}]}
         second.subchannel_id = Some(2);
         second.user_applications = vec![crate::config::UserApplication::Slideshow];
         config.services[0].components.push(second);
-        let sent: HashSet<Vec<u8>> = run(&config.validate().unwrap(), 41)
+        let config = config.validate().unwrap();
+        let sent: HashSet<Vec<u8>> = run(&config, 41)
             .iter()
             .flatten()
             .map(|fig| fig.bytes.clone())
@@ -1412,6 +1904,10 @@ output: {destinations: [{protocol: tcp, listen_port: 8850}]}
             sent.contains(&vec![5, 8, 0x4d, 0xa4, 1, 2]),
             "FIG 0/8 short form, SCIdS 1"
         );
+        // A secondary audio component: MCI, not the slower rate (clause 6.1).
+        assert!(mci_groups(&config)
+            .iter()
+            .any(|group| group.extension == 8 && group.entries == [vec![0x4d, 0xa4, 1, 2]]));
         assert!(sent.contains(&vec![8, 13, 0x4d, 0xa4, 0x11, 0, 0x42, 12, 60]));
     }
 
