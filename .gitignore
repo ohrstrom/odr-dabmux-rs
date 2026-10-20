@@ -19,6 +19,7 @@ tmp/
 
 docs/local/*
 .omx/
+.omc/
 .codex/*
 !.codex/agents/
 !.codex/agents/**

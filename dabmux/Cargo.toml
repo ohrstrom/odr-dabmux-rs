@@ -3,6 +3,7 @@ name = "dabmux"
 version = "0.0.1-rc.0"
 edition = "2021"
 description = "DAB multiplexer"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal", "fs"] }
