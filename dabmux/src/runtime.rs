@@ -1306,6 +1306,20 @@ fn clock_for(
     Ok(next)
 }
 
+/// Advance the frame clock and the independent MNSC UTC clock together.
+///
+/// MNSC must not be derived from `clock` after a TIST offset change: changing
+/// the offset shifts the EDI clock, but does not change UTC.  Keeping this
+/// update next to the normal frame tick also mirrors ODR-DabMux's separate
+/// `mnsc_time` state.
+fn tick_clocks(clock: &mut FrameClock, mnsc_seconds: &mut i64) {
+    let previous_second = clock.unix_seconds;
+    clock.tick();
+    if clock.unix_seconds != previous_second {
+        *mnsc_seconds += 1;
+    }
+}
+
 /// FIG 0/7 count after an activation. A count set in the new configuration
 /// wins; otherwise a structural change advances the signalled count.
 fn next_reconfiguration_counter(
@@ -1327,6 +1341,7 @@ fn next_reconfiguration_counter(
 fn build_packet(
     config: &ValidatedConfig,
     clock: FrameClock,
+    mnsc_seconds: i64,
     fic: &[u8],
     payloads: &[Vec<u8>],
     tai_offset: u8,
@@ -1347,7 +1362,7 @@ fn build_packet(
     let frame = assemble(
         config.source.ensemble.mode,
         clock,
-        mnsc(clock.unix_seconds, clock.fp()),
+        mnsc(mnsc_seconds, clock.fp()),
         fic,
         &streams,
         tist,
@@ -1438,6 +1453,9 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         u64::try_from(shifted_now)?,
         initial.source.ensemble.tist_at_fct0_ms,
     )?;
+    // MNSC follows UTC frame progression, independently of TIST offset
+    // changes applied to `clock` during a live reconfiguration.
+    let mut mnsc_seconds = clock.unix_seconds;
     let mut reconfiguration_counter = initial.source.ensemble.reconfiguration_counter;
     let mut carousel = FicCarousel::new().with_reconfiguration_counter(reconfiguration_counter);
     let mut seq = 0u16;
@@ -1487,7 +1505,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
                 // Keep the 24 ms grid: this frame takes the slot `frames` later.
                 stats.missed_ticks.fetch_add(frames, Ordering::Relaxed);
                 for _ in 0..frames {
-                    clock.tick();
+                    tick_clocks(&mut clock, &mut mnsc_seconds);
                 }
                 let period = Duration::from_millis(FRAME_PERIOD_MS);
                 tick.reset_at(instant + period * (frames as u32 + 1));
@@ -1680,7 +1698,15 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
 
         // A failed frame is skipped and counted; the mux keeps its timing.
         let packet = carousel.write(&active, clock).and_then(|fic| {
-            let packet = build_packet(&active, clock, &fic, &payloads, tai_clock.offset(), seq)?;
+            let packet = build_packet(
+                &active,
+                clock,
+                mnsc_seconds,
+                &fic,
+                &payloads,
+                tai_clock.offset(),
+                seq,
+            )?;
             let fragments = fragment_af(&packet, seq)?;
             Ok((packet, fragments))
         });
@@ -1752,7 +1778,7 @@ pub async fn run(config: SharedConfig, stats: Arc<RuntimeStats>) -> Result<()> {
         }
 
         seq = seq.wrapping_add(1);
-        clock.tick();
+        tick_clocks(&mut clock, &mut mnsc_seconds);
         debug_assert_eq!(receivers.len(), active.subchannels.len());
     }
 }
@@ -1900,6 +1926,23 @@ mod tests {
         // Six seconds after the last switch at the earliest.
         assert_eq!(reconfiguration_frame(1000, 980), 1240);
         assert_eq!(reconfiguration_frame(1000, 1000), 1260);
+    }
+
+    #[test]
+    fn mnsc_clock_is_not_shifted_by_tist_reconfiguration() {
+        let mut clock = FrameClock::new(249, 1_700_000_000, 992).unwrap();
+        let mut mnsc_seconds = clock.unix_seconds;
+
+        // A TIST offset change can move the EDI clock across a UTC second,
+        // but it must not move MNSC with it.
+        clock.shift_millis(24).unwrap();
+        assert_eq!(clock.unix_seconds, 1_700_000_001);
+        assert_eq!(mnsc_seconds, 1_700_000_000);
+
+        // MNSC advances only when an emitted frame crosses a second boundary.
+        clock.millisecond = 976;
+        tick_clocks(&mut clock, &mut mnsc_seconds);
+        assert_eq!(mnsc_seconds, 1_700_000_001);
     }
 
     #[tokio::test]
